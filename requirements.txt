@@ -1,0 +1,60 @@
+# Основные библиотеки глубокого обучения
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Обработка 3D геометрии
+trimesh>=3.23.0
+
+# Работа с данными
+numpy>=1.24.0
+pandas>=2.0.0
+
+# Обработка изображений
+Pillow>=9.5.0
+
+# Визуализация
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# GUI (PyQt5)
+PyQt5>=5.15.0
+
+# Прогресс-бары
+tqdm>=4.65.0
+
+# Работа с JSON
+# (встроен в Python, дополнительная установка не требуется)
+
+# ================================================================================
+# ИНСТРУКЦИЯ ПО УСТАНОВКЕ:
+# ================================================================================
+# 
+# 1. Создайте виртуальное окружение:
+#    python -m venv venv
+#    
+# 2. Активируйте окружение:
+#    - Windows: venv\Scripts\activate
+#    - Linux/Mac: source venv/bin/activate
+#    
+# 3. Установите зависимости:
+#    pip install -r requirements.txt
+#    
+# 4. Для CUDA 11.8:
+#    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+#    
+# 5. Для CUDA 12.1:
+#    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#    
+# 6. Для CPU only:
+#    pip install torch torchvision
+#
+# ================================================================================
+# ПРОВЕРКА УСТАНОВКИ:
+# ================================================================================
+#
+# python -c "import torch; print(f'PyTorch: {torch.__version__}')"
+# python -c "import torch; print(f'CUDA: {torch.cuda.is_available()}')"
+# python -c "import trimesh; print('Trimesh: OK')"
+# python -c "import PyQt5; print('PyQt5: OK')"
+#
+# ================================================================================
