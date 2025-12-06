@@ -1,0 +1,70 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyTorch / ML specific
+*.pth
+checkpoints/
+cache/
+inference_results/
+visualizations/
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Environment variables
+.env
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Miniconda environment (since project is in env)
+bin/
+etc/
+include/
+lib/
+share/
+ssl/
+x86_64-conda-linux-gnu/
+compiler_compat/
+conda-meta/
+man/
+
+# Data - only include metadata
+PIX3D_DATA/img/
+PIX3D_DATA/mask/
+PIX3D_DATA/model/
