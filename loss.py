@@ -9,103 +9,144 @@
 """
 import torch
 import torch.nn as nn
-
-def chamfer_distance(p1, p2):
-    """
-    Chamfer Distance между двумя облаками точек.
-    Измеряет расстояние между предсказанной и истинной формой.
-    
-    Args:
-        p1: [B, N, 3] - Предсказанные вершины
-        p2: [B, M, 3] - Ground Truth вершины
-    
-    Returns:
-        loss: scalar - Среднее расстояние Chamfer
-    """
-    # Расширяем размерности для вычисления попарных расстояний
-    x = p1.unsqueeze(2)  # [B, N, 1, 3]
-    y = p2.unsqueeze(1)  # [B, 1, M, 3]
-    
-    # Вычисляем матрицу расстояний
-    dist = torch.norm(x - y, dim=3)  # [B, N, M]
-    
-    # Для каждой точки p1 находим ближайшую в p2
-    min_dist_p1, _ = torch.min(dist, dim=2)  # [B, N]
-    
-    # Для каждой точки p2 находим ближайшую в p1
-    min_dist_p2, _ = torch.min(dist, dim=1)  # [B, M]
-    
-    # Chamfer Distance = среднее по обоим направлениям
-    return torch.mean(min_dist_p1) + torch.mean(min_dist_p2)
+import torch.nn.functional as F
+from typing import Dict
 
 
-def edge_length_regularization(vertices, edges):
+class OccupancyLoss(nn.Module):
     """
-    Регуляризация длины ребер для предотвращения деформации сетки.
-    Минимизирует вариацию длин ребер для более равномерной сетки.
+    Loss для обучения Occupancy Network.
     
-    Args:
-        vertices: [B, V, 3] - Координаты вершин
-        edges: [E, 2] - Индексы ребер
-    
-    Returns:
-        loss: scalar - Вариация длин ребер
-    """
-    if not isinstance(edges, torch.Tensor):
-        edges = torch.from_numpy(edges).to(vertices.device)
-    
-    # Получаем вершины на концах каждого ребра
-    v1 = vertices[:, edges[:, 0]]  # [B, E, 3]
-    v2 = vertices[:, edges[:, 1]]  # [B, E, 3]
-    
-    # Вычисляем длины всех ребер
-    lengths = torch.norm(v1 - v2, dim=2)  # [B, E]
-    
-    # Минимизируем вариацию (делает длины более однородными)
-    return torch.var(lengths)
-
-
-class CompositeLoss(nn.Module):
-    """
-    Комбинированная функция потерь для Pixel2Mesh.
-    Состоит из:
-    1. Chamfer Distance - основная метрика формы
-    2. Edge Regularization - сглаживание сетки
+    Основной loss: Binary Cross Entropy
+    + опциональная регуляризация
     """
     
-    def __init__(self, edges=None, lambda_chamfer=1.0, lambda_edge=0.1):
-        """
-        Args:
-            edges: [E, 2] numpy array с индексами ребер
-            lambda_chamfer: Вес Chamfer Distance (ИЗМЕНЕНО: 1.0 вместо 10.0!)
-            lambda_edge: Вес регуляризации ребер
-        """
+    def __init__(
+        self,
+        pos_weight: float = 1.0,  # Вес для позитивного класса
+        label_smoothing: float = 0.0
+    ):
         super().__init__()
-        self.edges = edges
-        self.lambda_chamfer = lambda_chamfer
-        self.lambda_edge = lambda_edge
         
-        print(f"[loss.py] CompositeLoss инициализирован:")
-        print(f"  - Chamfer Distance (λ={lambda_chamfer})")
-        if edges is not None:
-            print(f"  - Edge Regularization (λ={lambda_edge}, {len(edges)} ребер)")
+        self.pos_weight = pos_weight
+        self.label_smoothing = label_smoothing
+        
+        print(f"[loss.py] OccupancyLoss: pos_weight={pos_weight}, smoothing={label_smoothing}")
 
-    def forward(self, pred_vertices, gt_vertices):
+    def forward(
+        self, 
+        logits: torch.Tensor, 
+        targets: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
         """
         Args:
-            pred_vertices: [B, V, 3] - Предсказанные вершины
-            gt_vertices: [B, M, 3] - Ground Truth вершины
-        
+            logits: [B, N] предсказанные logits
+            targets: [B, N] ground truth occupancy (0 или 1)
+            
         Returns:
-            total_loss: scalar
+            dict с 'total' и отдельными компонентами loss
         """
-        # 1. Chamfer Distance (главная метрика)
-        cd_loss = chamfer_distance(pred_vertices, gt_vertices)
-        total_loss = self.lambda_chamfer * cd_loss
+        # Label smoothing
+        if self.label_smoothing > 0:
+            targets = targets * (1 - self.label_smoothing) + 0.5 * self.label_smoothing
         
-        # 2. Edge Regularization (опционально)
-        if self.edges is not None and self.lambda_edge > 0:
-            edge_loss = edge_length_regularization(pred_vertices, self.edges)
-            total_loss = total_loss + self.lambda_edge * edge_loss
+        # BCE Loss с pos_weight
+        pos_weight = torch.tensor([self.pos_weight], device=logits.device)
         
-        return total_loss
+        bce_loss = F.binary_cross_entropy_with_logits(
+            logits, 
+            targets,
+            pos_weight=pos_weight
+        )
+        
+        # Метрики для логирования
+        with torch.no_grad():
+            probs = torch.sigmoid(logits)
+            preds = (probs > 0.5).float()
+            accuracy = (preds == targets).float().mean()
+            
+            # Баланс классов в батче
+            pos_ratio = targets.mean()
+        
+        return {
+            'total': bce_loss,
+            'bce': bce_loss,
+            'accuracy': accuracy,
+            'pos_ratio': pos_ratio
+        }
+
+
+class IoULoss(nn.Module):
+    """
+    Intersection over Union loss.
+    Дифференцируемая версия IoU.
+    """
+    
+    def __init__(self, smooth: float = 1e-6):
+        super().__init__()
+        self.smooth = smooth
+
+    def forward(
+        self, 
+        logits: torch.Tensor, 
+        targets: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Args:
+            logits: [B, N]
+            targets: [B, N]
+        """
+        probs = torch.sigmoid(logits)
+        
+        # Intersection
+        intersection = (probs * targets).sum(dim=1)
+        
+        # Union
+        union = probs.sum(dim=1) + targets.sum(dim=1) - intersection
+        
+        # IoU
+        iou = (intersection + self.smooth) / (union + self.smooth)
+        
+        # Loss = 1 - IoU
+        return 1 - iou.mean()
+
+
+class CombinedLoss(nn.Module):
+    """
+    Комбинированный loss: BCE + IoU.
+    """
+    
+    def __init__(
+        self,
+        bce_weight: float = 1.0,
+        iou_weight: float = 0.5,
+        pos_weight: float = 1.0
+    ):
+        super().__init__()
+        
+        self.bce_loss = OccupancyLoss(pos_weight=pos_weight)
+        self.iou_loss = IoULoss()
+        
+        self.bce_weight = bce_weight
+        self.iou_weight = iou_weight
+        
+        print(f"[loss.py] CombinedLoss: BCE×{bce_weight} + IoU×{iou_weight}")
+
+    def forward(
+        self, 
+        logits: torch.Tensor, 
+        targets: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        
+        bce_dict = self.bce_loss(logits, targets)
+        iou = self.iou_loss(logits, targets)
+        
+        total = self.bce_weight * bce_dict['bce'] + self.iou_weight * iou
+        
+        return {
+            'total': total,
+            'bce': bce_dict['bce'],
+            'iou': iou,
+            'accuracy': bce_dict['accuracy'],
+            'pos_ratio': bce_dict['pos_ratio']
+        }
