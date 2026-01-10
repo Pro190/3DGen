@@ -3,7 +3,7 @@
 Автор: Бадрханов Аслан-бек Поладович.
 Руководитель: Простомолотов Андрей Сергеевич.
 Тема ВКР: "Генерация трехмерных моделей мебели на основе изображения".
-Описание: Ядро нейросети: архитектура Pixel2Mesh, включающая энкодер, декодер и графовые свертки (GraphConv).
+Описание: Ядро нейросети: архитектура Occupancy Network, включающая энкодер, декодер.
 Дата: 2026
 ================================================================================
 """
@@ -11,147 +11,204 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
-from geometry import create_high_res_icosphere
+from torchvision.models import ResNet18_Weights, ResNet34_Weights
+from typing import Tuple, Optional
 
-class ResNetEncoder(nn.Module):
-    """Энкодер на базе ResNet18 для извлечения фичей из изображения"""
+
+class ImageEncoder(nn.Module):
+    """
+    Encoder изображения на базе ResNet.
+    Извлекает глобальный feature vector.
+    """
     
-    def __init__(self):
+    def __init__(
+        self, 
+        backbone: str = 'resnet18',
+        latent_dim: int = 512,
+        pretrained: bool = True
+    ):
         super().__init__()
-        # Загрузка предобученного ResNet18
-        from torchvision.models import ResNet18_Weights
-        resnet = models.resnet18(weights=ResNet18_Weights.DEFAULT)
         
-        # Убираем последние слои (fc и avgpool), чтобы получить пространственные фичи
-        self.features = nn.Sequential(*list(resnet.children())[:-2])
-        self.out_channels = 512  # ResNet18 выдает 512 каналов
+        # Выбор backbone
+        if backbone == 'resnet18':
+            weights = ResNet18_Weights.DEFAULT if pretrained else None
+            resnet = models.resnet18(weights=weights)
+            resnet_out_dim = 512
+        elif backbone == 'resnet34':
+            weights = ResNet34_Weights.DEFAULT if pretrained else None
+            resnet = models.resnet34(weights=weights)
+            resnet_out_dim = 512
+        else:
+            raise ValueError(f"Неизвестный backbone: {backbone}")
+        
+        # Убираем последний FC слой
+        self.features = nn.Sequential(*list(resnet.children())[:-1])
+        
+        # Проекция в latent space
+        self.fc = nn.Linear(resnet_out_dim, latent_dim)
+        
+        self.latent_dim = latent_dim
+        
+        print(f"[model.py] Encoder: {backbone}, latent_dim={latent_dim}")
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x: [B, 3, 224, 224]
+            
         Returns:
-            features: [B, 512, 7, 7]
+            latent: [B, latent_dim]
         """
-        return self.features(x)
+        features = self.features(x)         # [B, 512, 1, 1]
+        features = features.flatten(1)      # [B, 512]
+        latent = self.fc(features)          # [B, latent_dim]
+        
+        return latent
 
 
-class GraphConv(nn.Module):
-    """Слой графовой свертки (GCN)"""
+class OccupancyDecoder(nn.Module):
+    """
+    Decoder для предсказания occupancy.
+    MLP который принимает (latent, point) и выдаёт occupancy.
+    """
     
-    def __init__(self, in_features, out_features):
+    def __init__(
+        self,
+        latent_dim: int = 512,
+        point_dim: int = 3,
+        hidden_dims: Tuple[int, ...] = (256, 256, 256, 256),
+        dropout: float = 0.0
+    ):
         super().__init__()
-        self.fc = nn.Linear(in_features, out_features)
+        
+        # Входная размерность: latent + point coordinates
+        input_dim = latent_dim + point_dim
+        
+        layers = []
+        current_dim = input_dim
+        
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(current_dim, hidden_dim))
+            layers.append(nn.ReLU(inplace=True))
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            current_dim = hidden_dim
+        
+        # Выходной слой
+        layers.append(nn.Linear(current_dim, 1))
+        
+        self.mlp = nn.Sequential(*layers)
+        
+        print(f"[model.py] Decoder: {input_dim} → {hidden_dims} → 1")
 
-    def forward(self, x, adj):
+    def forward(
+        self, 
+        latent: torch.Tensor, 
+        points: torch.Tensor
+    ) -> torch.Tensor:
         """
         Args:
-            x: [B, V, F_in] - фичи вершин
-            adj: [V, V] - матрица смежности
+            latent: [B, latent_dim]
+            points: [B, N, 3] query points
+            
         Returns:
-            x: [B, V, F_out] - трансформированные фичи
+            occupancy: [B, N] значения occupancy (logits)
         """
-        # Операция GCN: H' = σ(AHW)
-        # 1. Агрегация соседей: AH
-        x = torch.matmul(adj, x) 
-        # 2. Линейная трансформация: HW
-        x = self.fc(x)
+        batch_size, num_points, _ = points.shape
+        
+        # Расширяем latent для каждой точки
+        latent_expanded = latent.unsqueeze(1).expand(-1, num_points, -1)  # [B, N, latent_dim]
+        
+        # Конкатенируем с координатами точек
+        x = torch.cat([latent_expanded, points], dim=-1)  # [B, N, latent_dim + 3]
+        
+        # Reshape для MLP
+        x = x.reshape(batch_size * num_points, -1)  # [B*N, latent_dim + 3]
+        
+        # MLP
+        x = self.mlp(x)  # [B*N, 1]
+        
+        # Reshape обратно
+        x = x.reshape(batch_size, num_points)  # [B, N]
+        
         return x
 
 
-class MeshDecoder(nn.Module):
-    """Декодер на базе Graph Convolutional Networks"""
+class OccupancyNetwork(nn.Module):
+    """
+    Полная модель Occupancy Network.
     
-    def __init__(self, in_features, hidden_dim=192, out_dim=3, num_layers=6):
+    Вход: изображение + query points
+    Выход: occupancy для каждой точки
+    """
+    
+    def __init__(
+        self,
+        backbone: str = 'resnet18',
+        latent_dim: int = 512,
+        hidden_dims: Tuple[int, ...] = (256, 256, 256, 256),
+        dropout: float = 0.0
+    ):
         super().__init__()
         
-        self.layers = nn.ModuleList()
+        self.encoder = ImageEncoder(
+            backbone=backbone,
+            latent_dim=latent_dim
+        )
         
-        # Входная размерность: (512 каналов * 7 * 7 пикселей) + 3 координаты = 25091
-        current_dim = in_features * 49 + 3 
+        self.decoder = OccupancyDecoder(
+            latent_dim=latent_dim,
+            hidden_dims=hidden_dims,
+            dropout=dropout
+        )
         
-        # Создаем 6 слоев GCN (как в оригинальном Pixel2Mesh)
-        for i in range(num_layers):
-            next_dim = hidden_dim if i < num_layers - 1 else out_dim
-            self.layers.append(GraphConv(current_dim, next_dim))
-            current_dim = next_dim
+        self.latent_dim = latent_dim
         
-    def forward(self, img_features, initial_mesh_coord, adj):
+        print(f"[model.py] OccupancyNetwork инициализирована")
+
+    def forward(
+        self, 
+        images: torch.Tensor, 
+        points: torch.Tensor
+    ) -> torch.Tensor:
         """
         Args:
-            img_features: [B, 512, 7, 7] - фичи из ResNet
-            initial_mesh_coord: [B, V, 3] - начальные координаты сферы
-            adj: [V, V] - матрица смежности
+            images: [B, 3, 224, 224]
+            points: [B, N, 3]
+            
         Returns:
-            offset: [B, V, 3] - смещение для каждой вершины
+            occupancy_logits: [B, N]
         """
-        batch_size = img_features.size(0)
+        # Encode image
+        latent = self.encoder(images)  # [B, latent_dim]
         
-        # 1. Сжатие пространственных фичей изображения
-        global_features = img_features.view(batch_size, -1)  # [B, 25088]
+        # Decode occupancy
+        logits = self.decoder(latent, points)  # [B, N]
         
-        # 2. Объединение глобальных фичей и координат сетки
-        # Расширяем глобальные фичи для каждой вершины
-        num_vertices = initial_mesh_coord.size(1)
-        expanded_features = global_features.unsqueeze(1).repeat(1, num_vertices, 1)
-        
-        # Конкатенация: [B, V, 25088 + 3] = [B, V, 25091]
-        x = torch.cat([expanded_features, initial_mesh_coord], dim=2)
-        
-        # 3. Проход через слои GCN
-        for i, layer in enumerate(self.layers):
-            x = layer(x, adj)
-            # ReLU после всех слоев кроме последнего
-            if i < len(self.layers) - 1:
-                x = F.relu(x)
-        
-        # Возвращаем СМЕЩЕНИЕ (offset), а не абсолютные координаты
-        return x
+        return logits
 
+    def encode(self, images: torch.Tensor) -> torch.Tensor:
+        """Только encoding (для инференса)."""
+        return self.encoder(images)
 
-class Pixel2Mesh(nn.Module):
-    """Основная модель Pixel2Mesh"""
-    
-    def __init__(self, subdivisions=3):
-        super().__init__()
-        
-        self.subdivisions = subdivisions
-        
-        # Создание начальной сетки (сфера)
-        vertices, faces, adjacency, edges = create_high_res_icosphere(subdivisions=subdivisions)
-        
-        print(f"[model.py] Инициализация: {vertices.shape[0]} вершин")
-        
-        # Сохранение геометрии как нетренируемых буферов
-        self.register_buffer('initial_mesh', torch.from_numpy(vertices))
-        self.register_buffer('adjacency', torch.from_numpy(adjacency))
-        self.faces = faces  # numpy array
-        self.edges = edges  # numpy array
-        
-        # Энкодер и декодер
-        self.encoder = ResNetEncoder()
-        self.decoder = MeshDecoder(in_features=self.encoder.out_channels) 
+    def decode(
+        self, 
+        latent: torch.Tensor, 
+        points: torch.Tensor
+    ) -> torch.Tensor:
+        """Только decoding (для инференса)."""
+        return self.decoder(latent, points)
 
-    def forward(self, x):
+    def predict_occupancy(
+        self, 
+        images: torch.Tensor, 
+        points: torch.Tensor
+    ) -> torch.Tensor:
         """
-        Args:
-            x: [B, 3, 224, 224] - батч изображений
+        Предсказание occupancy с sigmoid.
+        
         Returns:
-            pred_vertices: [B, V, 3] - предсказанные координаты вершин
+            occupancy: [B, N] значения в [0, 1]
         """
-        # 1. Извлечение фичей из изображения
-        img_features = self.encoder(x)  # [B, 512, 7, 7]
-        
-        batch_size = x.size(0)
-        
-        # 2. Клонирование начальной сферы для батча
-        mesh = self.initial_mesh.unsqueeze(0).expand(batch_size, -1, -1).to(x.device)
-        adj = self.adjacency.to(x.device)
-        
-        # 3. Предсказание смещения через декодер
-        offset = self.decoder(img_features, mesh, adj)
-        
-        # 4. Применение смещения к начальной сфере
-        pred_vertices = mesh + offset
-        
-        return pred_vertices
+        logits = self.forward(images, points)
+        return torch.sigmoid(logits)
