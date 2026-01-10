@@ -7,63 +7,182 @@
 Дата: 2026
 ================================================================================
 """
-# Основные библиотеки глубокого обучения
+# ─────────────────────────────────────────────────────────────────────
+# DEEP LEARNING
+# ─────────────────────────────────────────────────────────────────────
 torch>=2.0.0
 torchvision>=0.15.0
 
-# Обработка 3D геометрии
-trimesh>=3.23.0
+# ─────────────────────────────────────────────────────────────────────
+# 3D GEOMETRY
+# ─────────────────────────────────────────────────────────────────────
+trimesh>=3.23.0          # Загрузка/сохранение мешей, сэмплирование
+scikit-image>=0.21.0     # Marching Cubes для извлечения поверхности
+rtree>=1.0.0             # Пространственные запросы (mesh.contains)
+pyglet<2                 # Визуализация trimesh (опционально)
+networkx>=3.0            # Графы для trimesh
 
-# Работа с данными
+# ─────────────────────────────────────────────────────────────────────
+# SCIENTIFIC COMPUTING
+# ─────────────────────────────────────────────────────────────────────
 numpy>=1.24.0
-pandas>=2.0.0
+scipy>=1.10.0            # KDTree, пространственные операции
 
-# Обработка изображений
+# ─────────────────────────────────────────────────────────────────────
+# IMAGE PROCESSING
+# ─────────────────────────────────────────────────────────────────────
 Pillow>=9.5.0
 
-# Визуализация
-matplotlib>=3.7.0
-seaborn>=0.12.0
-
-# GUI (PyQt5)
+# ─────────────────────────────────────────────────────────────────────
+# GUI
+# ─────────────────────────────────────────────────────────────────────
 PyQt5>=5.15.0
 
-# Прогресс-бары
-tqdm>=4.65.0
+# ─────────────────────────────────────────────────────────────────────
+# UTILITIES
+# ─────────────────────────────────────────────────────────────────────
+tqdm>=4.65.0             # Прогресс-бары
 
-# Работа с JSON
-# (встроен в Python, дополнительная установка не требуется)
+# ─────────────────────────────────────────────────────────────────────
+# OPTIONAL: Сравнение с InstantMesh через API
+# ─────────────────────────────────────────────────────────────────────
+# gradio_client>=0.6.0   # Для вызова HuggingFace Spaces
 
-# ================================================================================
-# ИНСТРУКЦИЯ ПО УСТАНОВКЕ:
-# ================================================================================
-# 
-# 1. Создайте виртуальное окружение:
-#    python -m venv venv
-#    
-# 2. Активируйте окружение:
-#    - Windows: venv\Scripts\activate
-#    - Linux/Mac: source venv/bin/activate
-#    
-# 3. Установите зависимости:
-#    pip install -r requirements.txt
-#    
-# 4. Для CUDA 11.8:
-#    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
-#    
-# 5. Для CUDA 12.1:
-#    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-#    
-# 6. Для CPU only:
-#    pip install torch torchvision
+
+# ═══════════════════════════════════════════════════════════════════
+# ИНСТРУКЦИЯ ПО УСТАНОВКЕ
+# ═══════════════════════════════════════════════════════════════════
 #
-# ================================================================================
-# ПРОВЕРКА УСТАНОВКИ:
-# ================================================================================
+# ─────────────────────────────────────────────────────────────────────
+# ВАРИАНТ 1: Стандартная установка (RTX 3000/4000 серия)
+# ─────────────────────────────────────────────────────────────────────
+#
+# 1. Создать окружение:
+#    conda create -n occnet python=3.10
+#    conda activate occnet
+#
+# 2. Установить PyTorch с CUDA:
+#    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#
+# 3. Установить системные зависимости (Linux/WSL):
+#    sudo apt-get update
+#    sudo apt-get install -y libspatialindex-dev
+#
+# 4. Установить Python зависимости:
+#    pip install -r requirements.txt
+#
+# ─────────────────────────────────────────────────────────────────────
+# ВАРИАНТ 2: Для RTX 5080/5090 (Blackwell, sm_120)
+# ─────────────────────────────────────────────────────────────────────
+#
+# RTX 50xx требует PyTorch nightly с поддержкой CUDA 12.4+
+#
+# 1. Создать окружение:
+#    conda create -n occnet python=3.10
+#    conda activate occnet
+#
+# 2. Установить PyTorch NIGHTLY:
+#    pip install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu124
+#
+# 3. Системные зависимости:
+#    sudo apt-get update
+#    sudo apt-get install -y libspatialindex-dev build-essential
+#
+# 4. Остальные зависимости:
+#    pip install -r requirements.txt
+#
+# ─────────────────────────────────────────────────────────────────────
+# ВАРИАНТ 3: Только CPU (если проблемы с GPU)
+# ─────────────────────────────────────────────────────────────────────
+#
+# 1. Создать окружение:
+#    conda create -n occnet python=3.10
+#    conda activate occnet
+#
+# 2. Установить PyTorch CPU:
+#    pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#
+# 3. Остальные зависимости:
+#    pip install -r requirements.txt
+#
+# ═══════════════════════════════════════════════════════════════════
+# ПРОВЕРКА УСТАНОВКИ
+# ═══════════════════════════════════════════════════════════════════
 #
 # python -c "import torch; print(f'PyTorch: {torch.__version__}')"
-# python -c "import torch; print(f'CUDA: {torch.cuda.is_available()}')"
-# python -c "import trimesh; print('Trimesh: OK')"
+# python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
+# python -c "import torch; print(f'CUDA version: {torch.version.cuda}')"
+# python -c "import trimesh; print('trimesh: OK')"
+# python -c "import rtree; print('rtree: OK')"
+# python -c "from skimage import measure; print('scikit-image: OK')"
 # python -c "import PyQt5; print('PyQt5: OK')"
 #
-# ================================================================================
+# Полная проверка:
+# python -c "
+# import torch
+# import trimesh
+# import rtree
+# from skimage import measure
+# import scipy
+# print('='*50)
+# print('Все зависимости установлены!')
+# print(f'PyTorch: {torch.__version__}')
+# print(f'CUDA: {torch.cuda.is_available()}')
+# if torch.cuda.is_available():
+#     print(f'GPU: {torch.cuda.get_device_name(0)}')
+# print('='*50)
+# "
+#
+# ═══════════════════════════════════════════════════════════════════
+# РЕШЕНИЕ ПРОБЛЕМ
+# ═══════════════════════════════════════════════════════════════════
+#
+# ─────────────────────────────────────────────────────────────────────
+# Проблема: "No module named 'rtree'"
+# ─────────────────────────────────────────────────────────────────────
+# Решение:
+#   sudo apt-get install libspatialindex-dev
+#   pip install rtree
+#
+# ─────────────────────────────────────────────────────────────────────
+# Проблема: "CUDA capability sm_120 is not compatible"
+# ─────────────────────────────────────────────────────────────────────
+# Это RTX 5080/5090. Решение:
+#   pip uninstall torch torchvision -y
+#   pip install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu124
+#
+# ─────────────────────────────────────────────────────────────────────
+# Проблема: "libGL.so.1: cannot open shared object file"
+# ─────────────────────────────────────────────────────────────────────
+# Решение (для WSL/headless servers):
+#   sudo apt-get install libgl1-mesa-glx libglib2.0-0
+#
+# ─────────────────────────────────────────────────────────────────────
+# Проблема: PyQt5 не запускается в WSL
+# ─────────────────────────────────────────────────────────────────────
+# Решение (нужен X server):
+#   # В Windows установить VcXsrv или WSLg
+#   export DISPLAY=:0
+#   python main.py
+#
+# ═══════════════════════════════════════════════════════════════════
+# БЫСТРЫЙ СТАРТ (копировать целиком)
+# ═══════════════════════════════════════════════════════════════════
+#
+# # Для стандартных GPU (RTX 3000/4000):
+# conda create -n occnet python=3.10 -y
+# conda activate occnet
+# sudo apt-get update && sudo apt-get install -y libspatialindex-dev
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# pip install -r requirements.txt
+# python train.py
+#
+# # Для RTX 5080/5090:
+# conda create -n occnet python=3.10 -y
+# conda activate occnet
+# sudo apt-get update && sudo apt-get install -y libspatialindex-dev
+# pip install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu124
+# pip install -r requirements.txt
+# python train.py
+#
+# ═══════════════════════════════════════════════════════════════════
