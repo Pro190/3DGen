@@ -68,3 +68,5 @@ man/
 PIX3D_DATA/img/
 PIX3D_DATA/mask/
 PIX3D_DATA/model/
+ss.py
+PIX3D_DATA/pix3d.json
