@@ -9,259 +9,342 @@
 """
 import torch
 from torch.utils.data import DataLoader
-from datasets import Pix3DDataset
-from model import Pixel2Mesh
-from loss import CompositeLoss
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 import os
-import glob
 import sys
-import re
 from datetime import datetime
+from typing import Dict, Tuple
+from tqdm import tqdm
+import warnings
 
-# ═══════════════════════════════════════════════════════════════════
-# КОНФИГУРАЦИЯ (оптимизировано для RTX 3060 Laptop 6GB + i5-12500H)
-# ═══════════════════════════════════════════════════════════════════
+warnings.filterwarnings('ignore')
 
-DATA_ROOT = './PIX3D_DATA'
-JSON_PATH = os.path.join(DATA_ROOT, 'pix3d.json')
-CHECKPOINT_DIR = './checkpoints/'
-
-# Параметры обучения
-BATCH_SIZE = 1          # RTX 3060 6GB - безопасный размер батча
-ACCUM_STEPS = 8        # Эффективный batch = 8
-NUM_EPOCHS = 150
-LEARNING_RATE = 1e-4
-
-# Параметры DataLoader (для i5-12500H и 64GB RAM)
-NUM_WORKERS = 6         # 6-8 оптимально для 12-ядерного CPU
-PIN_MEMORY = False       # Ускорение передачи данных на GPU
-
-# Частота логирования
-LOG_INTERVAL = 10       # Каждые N батчей выводим loss
-DEBUG_INTERVAL = 50     # Каждые N батчей детальная статистика
-SAVE_INTERVAL = 5       # Сохранять чекпоинт каждые N эпох (в дополнение к последней)
-
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-# ═══════════════════════════════════════════════════════════════════
-
-# Инициализация GradScaler для mixed precision (FP16)
-if torch.cuda.is_available():
-    scaler = torch.cuda.amp.GradScaler()
-    print(f"[train.py] Mixed precision (FP16) включен")
-else:
-    scaler = None
-    print(f"[train.py] CUDA недоступна, обучение на CPU")
-
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+from config import get_config, Config
+from datasets import create_train_val_split, collate_fn
+from model import OccupancyNetwork
+from loss import CombinedLoss
+from metrics import compute_occupancy_metrics, MetricsTracker
 
 
-def load_checkpoint(model, optimizer, scaler, checkpoint_dir):
-    """
-    Автоматически находит и загружает последний чекпоинт.
+class Trainer:
+    """Класс для обучения модели."""
     
-    Returns:
-        start_epoch: С какой эпохи продолжать обучение
-    """
-    checkpoint_files = glob.glob(os.path.join(checkpoint_dir, 'model*.pth'))
-    
-    if not checkpoint_files:
-        print("[train.py] Чекпоинты не найдены. Начинаю обучение с нуля.")
-        return 0
-
-    # Находим последний файл по времени создания
-    latest_file = max(checkpoint_files, key=os.path.getctime)
-    print(f"[train.py] Загружаю чекпоинт: {latest_file}")
-    
-    try:
-        checkpoint = torch.load(latest_file, map_location=DEVICE)
-
-        # Проверяем формат чекпоинта
-        if isinstance(checkpoint, dict) and 'epoch' in checkpoint:
-            # Полный формат (с optimizer и scaler)
-            model.load_state_dict(checkpoint['model_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            
-            if 'scaler_state_dict' in checkpoint and scaler is not None:
-                scaler.load_state_dict(checkpoint['scaler_state_dict'])
-            
-            start_epoch = checkpoint['epoch']
-            print(f"[train.py] Возобновление с эпохи {start_epoch + 1}")
-            return start_epoch
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.device = cfg.device
         
+        print(f"[train.py] Устройство: {self.device}")
+        
+        if self.device == 'cuda' and torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+            print(f"[train.py] GPU: {gpu_name}")
+        
+        # Модель
+        self.model = OccupancyNetwork(
+            backbone=cfg.model.encoder_type,
+            latent_dim=cfg.model.latent_dim,
+            hidden_dims=cfg.model.decoder_hidden_dims,
+            dropout=cfg.model.decoder_dropout
+        ).to(self.device)
+        
+        num_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        print(f"[train.py] Параметров: {num_params:,}")
+        
+        # Loss
+        self.criterion = CombinedLoss(
+            bce_weight=1.0,
+            iou_weight=0.5,
+            pos_weight=1.0
+        )
+        
+        # Optimizer
+        self.optimizer = AdamW(
+            self.model.parameters(),
+            lr=cfg.train.learning_rate,
+            weight_decay=cfg.train.weight_decay
+        )
+        
+        # Scheduler
+        self.scheduler = CosineAnnealingLR(
+            self.optimizer,
+            T_max=cfg.train.num_epochs,
+            eta_min=1e-6
+        )
+        
+        # AMP
+        self.use_amp = cfg.use_amp and self.device == 'cuda'
+        if self.use_amp:
+            self.scaler = torch.amp.GradScaler('cuda')
+            print("[train.py] AMP (FP16) включён")
         else:
-            # Старый формат (только веса модели)
-            model.load_state_dict(checkpoint)
+            self.scaler = None
+        
+        self.best_val_loss = float('inf')
+        self.best_val_iou = 0.0
+        self.start_epoch = 0
+
+    def load_checkpoint(self, path: str) -> None:
+        """Загрузка чекпоинта."""
+        if not os.path.exists(path):
+            print(f"[train.py] Чекпоинт не найден: {path}")
+            return
+        
+        print(f"[train.py] Загружаю: {path}")
+        checkpoint = torch.load(path, map_location=self.device)
+        
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+        if 'scheduler_state_dict' in checkpoint:
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        if 'scaler_state_dict' in checkpoint and self.scaler and checkpoint.get('scaler_state_dict'):
+            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        
+        self.start_epoch = checkpoint.get('epoch', 0)
+        self.best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+        self.best_val_iou = checkpoint.get('best_val_iou', 0.0)
+        
+        print(f"[train.py] Возобновление с эпохи {self.start_epoch + 1}")
+
+    def save_checkpoint(self, epoch: int, is_best: bool = False) -> None:
+        """Сохранение чекпоинта."""
+        os.makedirs(self.cfg.paths.checkpoint_dir, exist_ok=True)
+        
+        state = {
+            'epoch': epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'scaler_state_dict': self.scaler.state_dict() if self.scaler else None,
+            'best_val_loss': self.best_val_loss,
+            'best_val_iou': self.best_val_iou,
+        }
+        
+        path = os.path.join(self.cfg.paths.checkpoint_dir, 'latest.pth')
+        torch.save(state, path)
+        
+        if is_best:
+            best_path = os.path.join(self.cfg.paths.checkpoint_dir, 'best.pth')
+            torch.save(state, best_path)
+            print(f"[train.py] ✓ Лучшая модель (IoU: {self.best_val_iou:.4f})")
+
+    def train_epoch(self, train_loader: DataLoader, epoch: int) -> Tuple[float, Dict[str, float]]:
+        """Обучение одной эпохи."""
+        self.model.train()
+        
+        tracker = MetricsTracker()
+        num_batches = 0
+        num_skipped = 0
+        
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", leave=False)
+        
+        for batch in pbar:
+            # Пропускаем пустые батчи
+            if batch is None:
+                num_skipped += 1
+                continue
             
-            # Пытаемся извлечь номер эпохи из имени файла
-            match = re.search(r'model(\d+)\.pth', latest_file)
-            start_epoch = int(match.group(1)) if match else 0
+            images = batch['image'].to(self.device)
+            points = batch['points'].to(self.device)
+            occupancies = batch['occupancies'].to(self.device)
             
-            print(f"[train.py] Загружены только веса. Возобновление с эпохи {start_epoch + 1}")
-            print("[train.py] ВНИМАНИЕ: Optimizer и Scaler сброшены!")
-            return start_epoch
+            self.optimizer.zero_grad()
+            
+            # Forward
+            with torch.amp.autocast('cuda', enabled=self.use_amp):
+                logits = self.model(images, points)
+                loss_dict = self.criterion(logits, occupancies)
+                loss = loss_dict['total']
+            
+            # Backward
+            if self.scaler:
+                self.scaler.scale(loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                loss.backward()
+                self.optimizer.step()
+            
+            # Метрики
+            metrics = compute_occupancy_metrics(logits, occupancies)
+            tracker.update(metrics, loss.item())
+            num_batches += 1
+            
+            # Прогресс
+            pbar.set_postfix({
+                'loss': f"{loss.item():.4f}",
+                'acc': f"{metrics.accuracy:.3f}",
+                'iou': f"{metrics.iou:.3f}",
+                'skip': num_skipped
+            })
+        
+        if num_batches == 0:
+            print(f"[train.py] ⚠️ Все батчи пустые! Проверьте данные.")
+            return 0.0, {'accuracy': 0, 'iou': 0}
+        
+        avg_metrics, avg_loss = tracker.compute()
+        
+        if num_skipped > 0:
+            print(f"[train.py] Пропущено батчей: {num_skipped}/{num_skipped + num_batches}")
+        
+        return avg_loss, avg_metrics.to_dict()
 
-    except Exception as e:
-        print(f"[train.py] ОШИБКА при загрузке чекпоинта: {e}")
-        print("[train.py] Начинаю обучение с нуля.")
-        return 0
+    @torch.no_grad()
+    def validate(self, val_loader: DataLoader) -> Tuple[float, Dict[str, float]]:
+        """Валидация."""
+        self.model.eval()
+        
+        tracker = MetricsTracker()
+        num_batches = 0
+        
+        for batch in tqdm(val_loader, desc="Validation", leave=False):
+            if batch is None:
+                continue
+            
+            images = batch['image'].to(self.device)
+            points = batch['points'].to(self.device)
+            occupancies = batch['occupancies'].to(self.device)
+            
+            with torch.amp.autocast('cuda', enabled=self.use_amp):
+                logits = self.model(images, points)
+                loss_dict = self.criterion(logits, occupancies)
+            
+            metrics = compute_occupancy_metrics(logits, occupancies)
+            tracker.update(metrics, loss_dict['total'].item())
+            num_batches += 1
+        
+        if num_batches == 0:
+            return 0.0, {'accuracy': 0, 'iou': 0}
+        
+        avg_metrics, avg_loss = tracker.compute()
+        return avg_loss, avg_metrics.to_dict()
 
-
-def save_checkpoint(epoch, model, optimizer, scaler, checkpoint_dir):
-    """
-    Сохраняет полное состояние для возобновления обучения.
-    """
-    state = {
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scaler_state_dict': scaler.state_dict() if scaler else None,
-        'timestamp': datetime.now().isoformat()
-    }
-    
-    # Сохраняем с номером эпохи
-    checkpoint_path = os.path.join(checkpoint_dir, f'model{epoch}.pth')
-    torch.save(state, checkpoint_path)
-    
-    # Сохраняем как "последний"
-    latest_path = os.path.join(checkpoint_dir, 'latest.pth')
-    torch.save(state, latest_path)
-    
-    print(f"[train.py] ✓ Чекпоинт сохранен: epoch {epoch}")
+    def train(self, train_loader: DataLoader, val_loader: DataLoader) -> None:
+        """Основной цикл обучения."""
+        
+        print("\n" + "="*60)
+        print("НАЧАЛО ОБУЧЕНИЯ")
+        print("="*60)
+        
+        for epoch in range(self.start_epoch, self.cfg.train.num_epochs):
+            # Train
+            train_loss, train_metrics = self.train_epoch(train_loader, epoch)
+            
+            print(f"\nEpoch {epoch + 1}/{self.cfg.train.num_epochs}")
+            print(f"  Train - Loss: {train_loss:.4f}, "
+                  f"Acc: {train_metrics['accuracy']:.4f}, "
+                  f"IoU: {train_metrics['iou']:.4f}")
+            
+            # Validation каждые N эпох
+            if (epoch + 1) % self.cfg.train.val_interval == 0:
+                val_loss, val_metrics = self.validate(val_loader)
+                
+                print(f"  Val   - Loss: {val_loss:.4f}, "
+                      f"Acc: {val_metrics['accuracy']:.4f}, "
+                      f"IoU: {val_metrics['iou']:.4f}")
+                
+                is_best = val_metrics['iou'] > self.best_val_iou
+                if is_best:
+                    self.best_val_iou = val_metrics['iou']
+                    self.best_val_loss = val_loss
+                
+                self.save_checkpoint(epoch, is_best)
+            else:
+                self.save_checkpoint(epoch)
+            
+            self.scheduler.step()
+            
+            current_lr = self.scheduler.get_last_lr()[0]
+            print(f"  LR: {current_lr:.2e}")
+        
+        print("\n" + "="*60)
+        print("ОБУЧЕНИЕ ЗАВЕРШЕНО")
+        print(f"Лучший Val IoU: {self.best_val_iou:.4f}")
+        print("="*60)
 
 
 def main():
-    print("=" * 70)
-    print(f"PIXEL2MESH TRAINING - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 70)
-    print(f"Устройство: {DEVICE}")
-    print(f"Batch size: {BATCH_SIZE} (аккумуляция: {ACCUM_STEPS}, эффективный: {BATCH_SIZE * ACCUM_STEPS})")
-    print(f"Workers: {NUM_WORKERS}")
-    print("=" * 70)
+    cfg = get_config()
     
-    # 1. Загрузка датасета
-    print("\n[1/4] Загружаю датасет...")
-    dataset = Pix3DDataset(DATA_ROOT, JSON_PATH)
-    dataloader = DataLoader(
-        dataset, 
-        batch_size=BATCH_SIZE, 
-        shuffle=True,
-        num_workers=NUM_WORKERS,
-        pin_memory=PIN_MEMORY,
-        persistent_workers=True if NUM_WORKERS > 0 else False
+    print("="*60)
+    print(f"OCCUPANCY NETWORK TRAINING")
+    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("="*60)
+    print(f"Device: {cfg.device}")
+    print(f"Category: {cfg.train.category_filter or 'all'}")
+    print(f"Batch size: {cfg.train.batch_size}")
+    print(f"Epochs: {cfg.train.num_epochs}")
+    print("="*60)
+    
+    # Seed
+    torch.manual_seed(cfg.train.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(cfg.train.seed)
+    
+    # Данные
+    print("\n[1/3] Загрузка данных...")
+    train_dataset, val_dataset = create_train_val_split(
+        root_dir=cfg.paths.data_root,
+        json_path=cfg.paths.json_path,
+        val_split=cfg.train.val_split,
+        seed=cfg.train.seed,
+        category_filter=cfg.train.category_filter,
+        num_points_surface=cfg.train.num_points_surface,
+        num_points_uniform=cfg.train.num_points_uniform,
+        surface_noise=cfg.train.surface_noise_std
     )
-    print(f"✓ Загружено {len(dataset)} образцов")
-
-    # 2. Создание модели
-    print("\n[2/4] Инициализирую модель...")
-    model = Pixel2Mesh(subdivisions=3).to(DEVICE)
     
-    # 3. Loss и оптимизатор
-    print("\n[3/4] Настраиваю loss и optimizer...")
-    # Передаем edges для регуляризации
-    criterion = CompositeLoss(
-        edges=model.edges,
-        lambda_chamfer=10.0,
-        lambda_edge=0.1
-    ).to(DEVICE)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=cfg.train.batch_size,
+        shuffle=True,
+        num_workers=cfg.train.num_workers,
+        pin_memory=cfg.train.pin_memory,
+        collate_fn=collate_fn,
+        drop_last=True,
+        persistent_workers=True if cfg.train.num_workers > 0 else False
+    )
     
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=cfg.train.batch_size,
+        shuffle=False,
+        num_workers=cfg.train.num_workers,
+        pin_memory=cfg.train.pin_memory,
+        collate_fn=collate_fn,
+        persistent_workers=True if cfg.train.num_workers > 0 else False
+    )
     
-    # 4. Загрузка чекпоинта (если есть)
-    print("\n[4/4] Проверяю наличие чекпоинтов...")
-    start_epoch = load_checkpoint(model, optimizer, scaler, CHECKPOINT_DIR)
+    print(f"Train batches: {len(train_loader)}")
+    print(f"Val batches: {len(val_loader)}")
     
-    print("\n" + "=" * 70)
-    print("НАЧИНАЮ ОБУЧЕНИЕ")
-    print("=" * 70 + "\n")
+    # Тест загрузки данных
+    print("\n[datasets.py] Тест загрузки...")
+    test_count = 0
+    for i in range(min(10, len(train_dataset.dataset))):
+        sample = train_dataset.dataset[i]
+        if sample is not None:
+            test_count += 1
+    print(f"[datasets.py] Тест: {test_count}/10 образцов загружены успешно")
     
-    model.train()
+    # Trainer
+    print("\n[2/3] Инициализация модели...")
+    trainer = Trainer(cfg)
     
-    # ═══════════════════════════════════════════════════════════════
-    # ОСНОВНОЙ ЦИКЛ ОБУЧЕНИЯ
-    # ═══════════════════════════════════════════════════════════════
+    # Чекпоинт
+    print("\n[3/3] Проверка чекпоинтов...")
+    checkpoint_path = os.path.join(cfg.paths.checkpoint_dir, 'latest.pth')
+    trainer.load_checkpoint(checkpoint_path)
     
-    for epoch in range(start_epoch, NUM_EPOCHS):
-        epoch_loss = 0.0
-        running_loss = 0.0
-        optimizer.zero_grad()
-        
-        try:
-            for i, batch in enumerate(dataloader):
-                
-                images = batch['image'].to(DEVICE)
-                gt_vertices = batch['vertices'].to(DEVICE)
-                
-                # Forward pass с автоматической FP16
-                with torch.amp.autocast('cuda', enabled=(DEVICE == 'cuda')):
-                    pred_vertices = model(images)
-                    loss = criterion(pred_vertices, gt_vertices)
-                    loss = loss / ACCUM_STEPS  # Нормализуем для аккумуляции
-                
-                # Backward pass
-                if scaler is not None:
-                    scaler.scale(loss).backward()
-                else:
-                    loss.backward()
-                
-                running_loss += loss.item() * ACCUM_STEPS
-                epoch_loss += loss.item() * ACCUM_STEPS
-                
-                # Шаг оптимизатора (каждые ACCUM_STEPS)
-                if (i + 1) % ACCUM_STEPS == 0:
-                    if scaler is not None:
-                        scaler.step(optimizer)
-                        scaler.update()
-                    else:
-                        optimizer.step()
-                    
-                    optimizer.zero_grad()
-                    
-                    # Логирование
-                    if (i + 1) % (ACCUM_STEPS * LOG_INTERVAL) == 0:
-                        avg_loss = running_loss / LOG_INTERVAL
-                        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] "
-                              f"Step [{i+1}/{len(dataloader)}] "
-                              f"Loss: {avg_loss:.4f}")
-                        running_loss = 0.0
-                
-                # Детальная статистика
-                if (i + 1) % DEBUG_INTERVAL == 0:
-                    with torch.no_grad():
-                        gt_min = gt_vertices.min().item()
-                        gt_max = gt_vertices.max().item()
-                        pred_min = pred_vertices.min().item()
-                        pred_max = pred_vertices.max().item()
-                        
-                        print(f"\n{'─' * 50}")
-                        print(f"DEBUG STEP {i+1}:")
-                        print(f"  GT   range: [{gt_min:.3f}, {gt_max:.3f}]")
-                        print(f"  PRED range: [{pred_min:.3f}, {pred_max:.3f}]")
-                        print(f"{'─' * 50}\n")
-        
-        except KeyboardInterrupt:
-            print("\n" + "!" * 70)
-            print("ПРЕРЫВАНИЕ: Ctrl+C обнаружен")
-            print("!" * 70)
-            print("Сохраняю текущее состояние...")
-            save_checkpoint(epoch, model, optimizer, scaler, CHECKPOINT_DIR)
-            print("✓ Состояние сохранено. Выход.")
-            sys.exit(0)
-        
-        # Статистика эпохи
-        avg_epoch_loss = epoch_loss / len(dataloader)
-        print("\n" + "=" * 70)
-        print(f"ЭПОХА {epoch+1}/{NUM_EPOCHS} ЗАВЕРШЕНА")
-        print(f"Средний loss: {avg_epoch_loss:.4f}")
-        print("=" * 70 + "\n")
-        
-        # Сохранение чекпоинта
-        if (epoch + 1) % SAVE_INTERVAL == 0 or (epoch + 1) == NUM_EPOCHS:
-            save_checkpoint(epoch + 1, model, optimizer, scaler, CHECKPOINT_DIR)
-    
-    print("\n" + "=" * 70)
-    print("ОБУЧЕНИЕ ЗАВЕРШЕНО!")
-    print("=" * 70)
+    # Обучение
+    try:
+        trainer.train(train_loader, val_loader)
+    except KeyboardInterrupt:
+        print("\n[train.py] Прервано пользователем")
+        trainer.save_checkpoint(trainer.start_epoch, is_best=False)
+        print("[train.py] Чекпоинт сохранён")
 
 
 if __name__ == '__main__':
