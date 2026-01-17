@@ -11,13 +11,12 @@
 
     1. ЗАГРУЗКА ИЗОБРАЖЕНИЯ
        - Чтение изображения мебели
-       - Применение маски (опционально) для удаления фона
+       - Маска ОПЦИОНАЛЬНА (по умолчанию не используется)
        - Resize до 224x224, нормализация ImageNet
 
     2. ENCODING
        - Пропускаем изображение через ResNet50
        - Получаем латентный вектор [1, 512]
-       - Этот вектор "описывает" 3D форму объекта
 
     3. СОЗДАНИЕ 3D СЕТКИ
        - Создаём равномерную сетку точек в пространстве [-0.5, 0.5]³
@@ -25,16 +24,14 @@
 
     4. ПРЕДСКАЗАНИЕ OCCUPANCY
        - Для каждой точки предсказываем вероятность "внутри объекта"
-       - Батчевая обработка для эффективности (по 100K точек)
-       - Получаем 3D volume с вероятностями
+       - Батчевая обработка для эффективности
 
     5. MARCHING CUBES
-       - Алгоритм извлечения изоповерхности из 3D volume
-       - Порог (threshold) определяет границу объекта
-       - Результат: треугольный меш (vertices + faces)
+       - Извлечение изоповерхности из 3D volume
+       - Результат: треугольный меш
 
     6. ПОСТОБРАБОТКА
-       - Удаление мелких компонентов (шум)
+       - Удаление мелких компонентов
        - Опциональное упрощение меша
        - Сохранение в .obj/.ply/.stl файл
 
@@ -53,13 +50,9 @@ from datetime import datetime
 from typing import Optional, Dict, Any
 from tqdm import tqdm
 
-# Marching Cubes из scikit-image
 from skimage import measure
-
-# Работа с мешами
 import trimesh
 
-# Наши модули
 from model import create_model
 from config import get_config
 
@@ -83,15 +76,6 @@ class Inferencer:
         device: Устройство ('cuda' или 'cpu')
         resolution: Разрешение 3D сетки (по умолчанию 128)
         threshold: Порог для Marching Cubes (по умолчанию 0.5)
-    
-    Пример:
-        inferencer = Inferencer(
-            checkpoint_path='./checkpoints/best.pth',
-            resolution=128
-        )
-        
-        mesh = inferencer.generate('photo.jpg')
-        mesh.export('result.obj')
     """
     
     def __init__(
@@ -105,22 +89,10 @@ class Inferencer:
         self.resolution = resolution
         self.threshold = threshold
         
-        # ─────────────────────────────────────────────────────────────────────
         # Загрузка модели
-        # ─────────────────────────────────────────────────────────────────────
-        
         self.model, self.config = self._load_model(checkpoint_path)
         
-        # ─────────────────────────────────────────────────────────────────────
-        # Трансформации для изображений
-        # ─────────────────────────────────────────────────────────────────────
-        #
-        # Такие же как при обучении (без аугментаций):
-        #   1. Resize до 224x224 (вход ResNet)
-        #   2. ToTensor: [0, 255] → [0, 1]
-        #   3. Normalize: стандартизация ImageNet
-        # ─────────────────────────────────────────────────────────────────────
-        
+        # Трансформации для изображений (без аугментаций)
         self.transform = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
@@ -134,49 +106,31 @@ class Inferencer:
         print(f"[infer.py] Resolution: {resolution}, Threshold: {threshold}")
     
     def _load_model(self, checkpoint_path: str) -> tuple:
-        """
-        Загрузка модели из чекпоинта.
-        
-        Args:
-            checkpoint_path: Путь к .pth файлу
-        
-        Returns:
-            Tuple[model, config]: загруженная модель и её конфигурация
-        
-        Raises:
-            FileNotFoundError: если чекпоинт не найден
-        """
+        """Загрузка модели из чекпоинта."""
         
         if not os.path.exists(checkpoint_path):
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
         
         print(f"[infer.py] Loading model from: {checkpoint_path}")
         
-        # Загружаем чекпоинт
         checkpoint = torch.load(
             checkpoint_path,
             map_location=self.device,
             weights_only=False
         )
         
-        # Извлекаем конфигурацию модели
         config = checkpoint.get('config', {})
         latent_dim = config.get('latent_dim', 512)
         num_frequencies = config.get('num_frequencies', 10)
         
-        # Создаём модель с такой же архитектурой
         model = create_model(
             latent_dim=latent_dim,
             num_frequencies=num_frequencies
         ).to(self.device)
         
-        # Загружаем веса
         model.load_state_dict(checkpoint['model_state_dict'])
-        
-        # Переводим в режим оценки (отключает dropout и т.д.)
         model.eval()
         
-        # Логирование информации
         epoch = checkpoint.get('epoch', '?')
         best_iou = checkpoint.get('best_iou', 0)
         
@@ -189,7 +143,8 @@ class Inferencer:
     def load_image(
         self,
         image_path: str,
-        mask_path: Optional[str] = None
+        mask_path: Optional[str] = None,
+        use_mask: bool = False
     ) -> torch.Tensor:
         """
         Загрузка и предобработка изображения.
@@ -197,49 +152,37 @@ class Inferencer:
         Args:
             image_path: Путь к изображению
             mask_path: Путь к маске сегментации (опционально)
+            use_mask: Применять ли маску (по умолчанию False)
         
         Returns:
             torch.Tensor [1, 3, 224, 224]: подготовленное изображение
         """
         
-        # Загружаем изображение
         img = Image.open(image_path).convert('RGB')
         
-        # ─────────────────────────────────────────────────────────────────────
-        # Применение маски (если указана)
-        # ─────────────────────────────────────────────────────────────────────
-        #
-        # Маска удаляет фон, заменяя его на белый цвет.
-        # Это помогает модели фокусироваться на объекте.
-        # ─────────────────────────────────────────────────────────────────────
-        
-        if mask_path and os.path.exists(mask_path):
+        # Маска применяется ТОЛЬКО если use_mask=True и маска существует
+        if use_mask and mask_path and os.path.exists(mask_path):
             try:
-                mask = Image.open(mask_path).convert('L')  # Grayscale
-                
-                # Создаём белый фон
+                mask = Image.open(mask_path).convert('L')
                 background = Image.new('RGB', img.size, (255, 255, 255))
-                
-                # Композитинг: объект на белом фоне
                 img = Image.composite(img, background, mask)
-                
                 print(f"[infer.py] Mask applied: {mask_path}")
             except Exception as e:
                 print(f"[infer.py] Warning: failed to apply mask: {e}")
+        else:
+            print(f"[infer.py] Generating from image only (no mask)")
         
-        # Применяем трансформации
         img_tensor = self.transform(img)
-        
-        # Добавляем batch dimension: [3, 224, 224] → [1, 3, 224, 224]
         img_tensor = img_tensor.unsqueeze(0)
         
         return img_tensor.to(self.device)
     
-    @torch.no_grad()  # Отключаем градиенты для инференса
+    @torch.no_grad()
     def generate(
         self,
         image_path: str,
         mask_path: Optional[str] = None,
+        use_mask: bool = False,
         resolution: Optional[int] = None,
         threshold: Optional[float] = None,
         verbose: bool = True
@@ -247,19 +190,12 @@ class Inferencer:
         """
         Генерация 3D меша из изображения.
         
-        Основной метод класса. Выполняет полный pipeline:
-            1. Загрузка изображения
-            2. Encoding в латентный вектор
-            3. Создание 3D сетки точек
-            4. Предсказание occupancy
-            5. Marching Cubes
-            6. Постобработка
-        
         Args:
             image_path: Путь к входному изображению
             mask_path: Путь к маске (опционально)
-            resolution: Разрешение сетки (None = использовать значение по умолчанию)
-            threshold: Порог для Marching Cubes (None = использовать значение по умолчанию)
+            use_mask: Использовать ли маску (по умолчанию False)
+            resolution: Разрешение сетки
+            threshold: Порог для Marching Cubes
             verbose: Выводить прогресс в консоль
         
         Returns:
@@ -272,99 +208,50 @@ class Inferencer:
         
         start_time = datetime.now()
         
-        # ─────────────────────────────────────────────────────────────────────
-        # Шаг 1: Загрузка изображения
-        # ─────────────────────────────────────────────────────────────────────
-        
+        # Загрузка изображения
         if verbose:
             print(f"\n[infer.py] Loading image: {image_path}")
         
-        img_tensor = self.load_image(image_path, mask_path)
+        img_tensor = self.load_image(image_path, mask_path, use_mask)
         
-        # ─────────────────────────────────────────────────────────────────────
-        # Шаг 2: Encoding
-        # ─────────────────────────────────────────────────────────────────────
-        #
-        # ResNet50 преобразует изображение [1, 3, 224, 224]
-        # в латентный вектор [1, 512], который "описывает" 3D форму.
-        # ─────────────────────────────────────────────────────────────────────
-        
+        # Encoding
         if verbose:
             print("[infer.py] Encoding image...")
         
         latent = self.model.encode(img_tensor)
         
-        # ─────────────────────────────────────────────────────────────────────
-        # Шаг 3: Создание 3D сетки точек
-        # ─────────────────────────────────────────────────────────────────────
-        #
-        # Создаём равномерную сетку в кубе [-0.5, 0.5]³
-        # Количество точек = resolution³
-        #
-        # Например, при resolution=128:
-        #   128³ = 2,097,152 точек
-        # ─────────────────────────────────────────────────────────────────────
-        
+        # Создание 3D сетки точек
         if verbose:
             print(f"[infer.py] Creating {resolution}³ grid ({resolution**3:,} points)...")
         
-        # Координаты по каждой оси
         coords = np.linspace(-0.5, 0.5, resolution).astype(np.float32)
-        
-        # 3D сетка (meshgrid)
         xx, yy, zz = np.meshgrid(coords, coords, coords, indexing='ij')
-        
-        # Преобразуем в массив точек [N, 3]
         grid_points = np.stack([xx, yy, zz], axis=-1).reshape(-1, 3)
         
-        # ─────────────────────────────────────────────────────────────────────
-        # Шаг 4: Предсказание occupancy
-        # ─────────────────────────────────────────────────────────────────────
-        #
-        # Для каждой точки предсказываем вероятность "внутри объекта".
-        # Обрабатываем батчами, т.к. все точки не влезут в GPU память.
-        # ─────────────────────────────────────────────────────────────────────
-        
+        # Предсказание occupancy
         if verbose:
             print("[infer.py] Predicting occupancy...")
         
         occupancy_values = []
-        batch_size = 100000  # 100K точек за раз
+        batch_size = 100000
         
-        # Итератор по батчам
         iterator = range(0, len(grid_points), batch_size)
         if verbose:
             iterator = tqdm(iterator, desc="Occupancy", leave=False)
         
         for i in iterator:
-            # Берём батч точек
             batch_points = grid_points[i:i + batch_size]
-            
-            # Конвертируем в тензор
             points_tensor = torch.from_numpy(batch_points).to(self.device)
-            
-            # Добавляем batch dimension: [N, 3] → [1, N, 3]
             points_tensor = points_tensor.unsqueeze(0)
             
-            # Forward pass через декодер
             logits = self.model.decode(latent, points_tensor)
-            
-            # Применяем sigmoid для получения вероятностей
             probs = torch.sigmoid(logits).squeeze(0)
-            
-            # Сохраняем на CPU
             occupancy_values.append(probs.cpu().numpy())
         
-        # Объединяем все батчи
         occupancy = np.concatenate(occupancy_values)
-        
-        # Преобразуем в 3D volume
         occupancy_grid = occupancy.reshape(resolution, resolution, resolution)
         
-        # ─────────────────────────────────────────────────────────────────────
-        # Статистика occupancy (для отладки)
-        # ─────────────────────────────────────────────────────────────────────
-        
+        # Статистика occupancy
         if verbose:
             print(f"\n[infer.py] Occupancy statistics:")
             print(f"  Mean: {occupancy_grid.mean():.3f}")
@@ -372,44 +259,33 @@ class Inferencer:
             print(f"  Min:  {occupancy_grid.min():.3f}")
             print(f"  Max:  {occupancy_grid.max():.3f}")
             print(f"  > 0.5: {(occupancy_grid > 0.5).mean() * 100:.1f}%")
-            print(f"  > 0.7: {(occupancy_grid > 0.7).mean() * 100:.1f}%")
-            print(f"  > 0.9: {(occupancy_grid > 0.9).mean() * 100:.1f}%")
         
-        # ─────────────────────────────────────────────────────────────────────
-        # Шаг 5: Marching Cubes
-        # ─────────────────────────────────────────────────────────────────────
-        #
-        # Алгоритм Marching Cubes извлекает изоповерхность из 3D volume.
-        #
-        # Принцип работы:
-        #   1. Проходим по всем "кубикам" (8 соседних вокселей)
-        #   2. Для каждого кубика определяем, какие вершины "внутри" (> threshold)
-        #   3. По таблице определяем, как провести треугольники через кубик
-        #   4. Результат: треугольный меш
-        #
-        # Параметры:
-        #   - level: порог (threshold) для изоповерхности
-        #   - spacing: размер вокселя в мировых координатах
-        # ─────────────────────────────────────────────────────────────────────
+        # Адаптивный порог при необходимости
+        occ_ratio = (occupancy_grid > threshold).mean()
         
+        if occ_ratio < 0.001:
+            if verbose:
+                print("[infer.py] ⚠️ Very low occupancy, trying adaptive threshold")
+            adaptive_threshold = np.percentile(occupancy_grid, 99)
+            threshold = max(adaptive_threshold, 0.1)
+            if verbose:
+                print(f"[infer.py] Adaptive threshold: {threshold:.3f}")
+        
+        # Marching Cubes
         if verbose:
-            print(f"\n[infer.py] Running Marching Cubes (threshold={threshold})...")
+            print(f"\n[infer.py] Running Marching Cubes (threshold={threshold:.3f})...")
         
         try:
-            # Размер вокселя
             spacing = 1.0 / resolution
             
-            # Marching Cubes
             vertices, faces, normals, _ = measure.marching_cubes(
                 occupancy_grid,
                 level=threshold,
                 spacing=(spacing, spacing, spacing)
             )
             
-            # Центрируем меш (сетка была в [0, 1], нужно [-0.5, 0.5])
             vertices = vertices - 0.5
             
-            # Создаём trimesh объект
             mesh = trimesh.Trimesh(
                 vertices=vertices,
                 faces=faces,
@@ -423,13 +299,9 @@ class Inferencer:
             print(f"[infer.py] Marching Cubes failed: {e}")
             return None
         
-        # ─────────────────────────────────────────────────────────────────────
-        # Шаг 6: Постобработка
-        # ─────────────────────────────────────────────────────────────────────
-        
+        # Постобработка
         mesh = self._postprocess_mesh(mesh, verbose=verbose)
         
-        # Время генерации
         elapsed = (datetime.now() - start_time).total_seconds()
         
         if verbose:
@@ -443,36 +315,12 @@ class Inferencer:
         mesh: trimesh.Trimesh,
         verbose: bool = True
     ) -> trimesh.Trimesh:
-        """
-        Постобработка меша.
-        
-        Выполняет:
-            1. Разделение на компоненты связности
-            2. Сохранение только самого большого компонента
-               (удаление мелкого "шума")
-        
-        Args:
-            mesh: Входной меш
-            verbose: Выводить информацию
-        
-        Returns:
-            Обработанный меш
-        """
-        
-        # ─────────────────────────────────────────────────────────────────────
-        # Удаление мелких компонентов
-        # ─────────────────────────────────────────────────────────────────────
-        #
-        # Marching Cubes может создать мелкие "островки" (артефакты).
-        # Оставляем только самый большой компонент связности.
-        # ─────────────────────────────────────────────────────────────────────
+        """Постобработка меша - удаление мелких компонентов."""
         
         try:
-            # Разбиваем на компоненты связности
             components = mesh.split(only_watertight=False)
             
             if len(components) > 1:
-                # Находим самый большой по количеству вершин
                 largest = max(components, key=lambda x: len(x.vertices))
                 
                 if verbose:
@@ -480,7 +328,7 @@ class Inferencer:
                 
                 mesh = largest
         except Exception:
-            pass  # Если split не удался, оставляем как есть
+            pass
         
         return mesh
     
@@ -489,6 +337,7 @@ class Inferencer:
         image_path: str,
         output_path: str,
         mask_path: Optional[str] = None,
+        use_mask: bool = False,
         resolution: Optional[int] = None,
         threshold: Optional[float] = None,
         simplify: bool = False,
@@ -497,32 +346,26 @@ class Inferencer:
         """
         Генерация и сохранение 3D модели.
         
-        Удобный метод, объединяющий generate() и export().
-        
         Args:
             image_path: Путь к входному изображению
             output_path: Путь для сохранения .obj файла
             mask_path: Путь к маске (опционально)
+            use_mask: Использовать ли маску (по умолчанию False)
             resolution: Разрешение сетки
             threshold: Порог Marching Cubes
             simplify: Упростить меш
             target_faces: Целевое количество граней при упрощении
         
         Returns:
-            Dict с информацией о результате:
-                - 'success': bool
-                - 'path': str (путь к файлу)
-                - 'vertices': int
-                - 'faces': int
-                - 'time': float (секунды)
+            Dict с информацией о результате
         """
         
         start_time = datetime.now()
         
-        # Генерация
         mesh = self.generate(
             image_path=image_path,
             mask_path=mask_path,
+            use_mask=use_mask,
             resolution=resolution,
             threshold=threshold,
             verbose=True
@@ -534,14 +377,7 @@ class Inferencer:
                 'error': 'Failed to generate mesh'
             }
         
-        # ─────────────────────────────────────────────────────────────────────
-        # Упрощение меша (опционально)
-        # ─────────────────────────────────────────────────────────────────────
-        #
-        # Quadric decimation уменьшает количество граней,
-        # сохраняя общую форму объекта.
-        # ─────────────────────────────────────────────────────────────────────
-        
+        # Упрощение меша
         if simplify and len(mesh.faces) > target_faces:
             print(f"[infer.py] Simplifying: {len(mesh.faces)} → {target_faces} faces...")
             try:
@@ -550,14 +386,8 @@ class Inferencer:
             except Exception as e:
                 print(f"[infer.py] Warning: simplification failed: {e}")
         
-        # ─────────────────────────────────────────────────────────────────────
         # Сохранение
-        # ─────────────────────────────────────────────────────────────────────
-        
-        # Создаём папку если не существует
         os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
-        
-        # Экспорт (формат определяется по расширению)
         mesh.export(output_path)
         
         elapsed = (datetime.now() - start_time).total_seconds()
@@ -584,14 +414,12 @@ def generate_mesh(
     resolution: int = 128,
     threshold: float = 0.5,
     mask_path: Optional[str] = None,
+    use_mask: bool = False,
     simplify: bool = False,
     target_faces: int = 10000
 ) -> Optional[trimesh.Trimesh]:
     """
     Функция для быстрой генерации 3D модели.
-    
-    Создаёт Inferencer, генерирует меш и сохраняет его.
-    Удобна для использования из других скриптов.
     
     Args:
         checkpoint_path: Путь к чекпоинту модели
@@ -600,20 +428,12 @@ def generate_mesh(
         resolution: Разрешение 3D сетки
         threshold: Порог Marching Cubes
         mask_path: Путь к маске (опционально)
+        use_mask: Использовать ли маску (по умолчанию False)
         simplify: Упростить меш
         target_faces: Целевое количество граней
     
     Returns:
         trimesh.Trimesh или None
-    
-    Пример:
-        from infer import generate_mesh
-        
-        mesh = generate_mesh(
-            checkpoint_path='./checkpoints/best.pth',
-            image_path='chair.jpg',
-            output_path='chair_3d.obj'
-        )
     """
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -629,12 +449,12 @@ def generate_mesh(
         image_path=image_path,
         output_path=output_path,
         mask_path=mask_path,
+        use_mask=use_mask,
         simplify=simplify,
         target_faces=target_faces
     )
     
     if result['success']:
-        # Загружаем и возвращаем меш
         return trimesh.load(output_path)
     else:
         return None
@@ -645,15 +465,7 @@ def generate_mesh(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    """
-    Главная функция для запуска из командной строки.
-    
-    Использование:
-        python infer.py --image photo.jpg
-        python infer.py --image photo.jpg --output result.obj
-        python infer.py --image photo.jpg --resolution 256 --threshold 0.4
-        python infer.py --image photo.jpg --mask mask.png --simplify
-    """
+    """Главная функция для запуска из командной строки."""
     
     parser = argparse.ArgumentParser(
         description='Generate 3D mesh from image using Occupancy Network',
@@ -663,24 +475,21 @@ Examples:
     python infer.py --image chair.jpg
     python infer.py --image chair.jpg --output ./results/chair.obj
     python infer.py --image chair.jpg --resolution 256 --threshold 0.4
-    python infer.py --image chair.jpg --mask chair_mask.png --simplify
+    python infer.py --image chair.jpg --mask chair_mask.png --use_mask
         """
     )
     
-    # Обязательные аргументы
     parser.add_argument(
         '--image', type=str, required=True,
         help='Path to input image'
     )
-    
-    # Опциональные аргументы
     parser.add_argument(
         '--checkpoint', type=str, default='./checkpoints/best.pth',
         help='Path to model checkpoint (default: ./checkpoints/best.pth)'
     )
     parser.add_argument(
         '--output', type=str, default=None,
-        help='Output path for 3D mesh (default: auto-generated in ./inference_results/)'
+        help='Output path for 3D mesh (default: auto-generated)'
     )
     parser.add_argument(
         '--resolution', type=int, default=128,
@@ -690,9 +499,14 @@ Examples:
         '--threshold', type=float, default=0.5,
         help='Marching Cubes threshold (default: 0.5)'
     )
+    # Маска теперь опциональна и по умолчанию НЕ используется
     parser.add_argument(
         '--mask', type=str, default=None,
         help='Path to segmentation mask (optional)'
+    )
+    parser.add_argument(
+        '--use_mask', action='store_true',
+        help='Apply mask to remove background (default: False)'
     )
     parser.add_argument(
         '--simplify', action='store_true',
@@ -709,12 +523,8 @@ Examples:
     
     args = parser.parse_args()
     
-    # ─────────────────────────────────────────────────────────────────────────
     # Определение пути для сохранения
-    # ─────────────────────────────────────────────────────────────────────────
-    
     if args.output is None:
-        # Автоматическое имя файла
         cfg = get_config()
         os.makedirs(cfg.paths.output_dir, exist_ok=True)
         
@@ -724,10 +534,7 @@ Examples:
             f"{base_name}_3d.{args.format}"
         )
     
-    # ─────────────────────────────────────────────────────────────────────────
     # Вывод параметров
-    # ─────────────────────────────────────────────────────────────────────────
-    
     print("=" * 60)
     print("OCCUPANCY NETWORK INFERENCE")
     print("=" * 60)
@@ -736,15 +543,12 @@ Examples:
     print(f"Output:     {args.output}")
     print(f"Resolution: {args.resolution}")
     print(f"Threshold:  {args.threshold}")
-    if args.mask:
+    print(f"Use mask:   {args.use_mask}")
+    if args.mask and args.use_mask:
         print(f"Mask:       {args.mask}")
     if args.simplify:
         print(f"Simplify:   Yes (target: {args.target_faces} faces)")
     print("=" * 60)
-    
-    # ─────────────────────────────────────────────────────────────────────────
-    # Генерация
-    # ─────────────────────────────────────────────────────────────────────────
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"\nDevice: {device}")
@@ -763,6 +567,7 @@ Examples:
             image_path=args.image,
             output_path=args.output,
             mask_path=args.mask,
+            use_mask=args.use_mask,
             simplify=args.simplify,
             target_faces=args.target_faces
         )
@@ -784,10 +589,6 @@ Examples:
         import traceback
         traceback.print_exc()
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ENTRY POINT
-# ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == '__main__':
     main()
