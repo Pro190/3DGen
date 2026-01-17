@@ -9,24 +9,29 @@
 
 Структура конфигурации:
     Config (главный класс)
-    ├── PathConfig      - пути к данным, чекпоинтам, результатам
-    ├── ModelConfig     - параметры архитектуры нейросети
-    ├── TrainConfig     - параметры обучения (lr, batch_size, epochs...)
-    └── InferConfig     - параметры инференса (resolution, threshold...)
+    ├── PathConfig   - пути к данным, чекпоинтам, результатам
+    ├── ModelConfig  - параметры архитектуры нейросети
+    ├── TrainConfig  - параметры обучения (lr, batch_size, epochs...)
+    └── InferConfig  - параметры инференса (resolution, threshold...)
 
 Использование:
-    from config import get_config
+    from config import get_config, update_config
+    
+    # Получение текущей конфигурации
     cfg = get_config()
+    
+    # Обновление параметров (из GUI или командной строки)
+    update_config(batch_size=64, learning_rate=1e-4)
     
     # Доступ к параметрам:
     cfg.paths.data_root      # './PIX3D_DATA'
     cfg.model.latent_dim     # 512
-    cfg.train.batch_size     # 32
+    cfg.train.batch_size     # 64 (обновлённое значение)
     cfg.device               # 'cuda' или 'cpu'
 """
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Dict, Any
 import torch
 import os
 
@@ -60,7 +65,7 @@ class PathConfig:
         
         Файл pix3d.json содержит список всех образцов с путями к:
         - изображениям (img)
-        - 3D моделям (model)  
+        - 3D моделям (model)
         - маскам сегментации (mask)
         - категориям мебели (category)
         """
@@ -77,6 +82,11 @@ class PathConfig:
         - Вычисления нормалей
         """
         return os.path.join(self.cache_dir, 'preprocessed')
+    
+    @property
+    def preprocessed_index(self) -> str:
+        """Путь к индексному файлу препроцессированных данных."""
+        return os.path.join(self.preprocessed_dir, 'index.json')
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -155,6 +165,9 @@ class TrainConfig:
         category_filter: Обучать только на одной категории мебели
                         None = все категории
                         'chair', 'table', 'bed', 'sofa', 'desk'...
+        
+        use_preprocessed: Использовать препроцессированные данные
+                         Ускоряет загрузку данных в ~10-20 раз
     """
     
     # Размер батча и количество эпох
@@ -166,35 +179,33 @@ class TrainConfig:
     weight_decay: float = 1e-4
     
     # Warmup scheduler
-    # Первые warmup_epochs эпох LR растёт линейно: 0.01*lr → lr
-    # Затем CosineAnnealing: lr → 1e-6
     warmup_epochs: int = 10
     
     # Gradient clipping для стабильности
     grad_clip: float = 1.0
     
     # Сэмплирование точек
-    # 4096 = 2048 inside + 2048 outside (примерно)
     num_points: int = 4096
     
     # DataLoader
-    num_workers: int = 8      # Потоки для загрузки данных
-    pin_memory: bool = True   # Ускоряет передачу на GPU
+    num_workers: int = 8
+    pin_memory: bool = True
     
     # Сохранение и валидация
-    save_interval: int = 10   # Сохранять каждые 10 эпох
-    val_interval: int = 1     # Валидация каждую эпоху
+    save_interval: int = 10
+    val_interval: int = 1
     
     # Разделение данных
-    val_split: float = 0.1    # 10% на валидацию
+    val_split: float = 0.1
     
     # Воспроизводимость
     seed: int = 42
     
     # Фильтр категории (None = все)
-    # Доступные: 'bed', 'bookcase', 'chair', 'desk', 'misc', 
-    #            'sofa', 'table', 'tool', 'wardrobe'
     category_filter: Optional[str] = None
+    
+    # Использовать препроцессированные данные
+    use_preprocessed: bool = False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -219,9 +230,6 @@ class InferConfig:
                    64  = быстро, грубая модель
                    128 = баланс качества и скорости
                    256 = высокое качество, медленно
-                   
-                   Количество точек = resolution³
-                   128³ = 2,097,152 точек
         
         threshold: Порог для Marching Cubes (isosurface level)
                   0.5 = стандартный (граница inside/outside)
@@ -231,11 +239,15 @@ class InferConfig:
         batch_size: Размер батча для предсказания occupancy
                    Больше = быстрее, но больше памяти GPU
                    100000 хорошо для 16GB GPU
+        
+        use_mask: Использовать маску для удаления фона
+                 По умолчанию False - генерация только по фото
     """
     
     resolution: int = 128
     threshold: float = 0.5
-    batch_size: int = 100000  # Точек за один forward pass
+    batch_size: int = 100000
+    use_mask: bool = False  # По умолчанию генерация только по фото
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -299,35 +311,81 @@ class Config:
         print("=" * 60)
         
         print("\n[Paths]")
-        print(f"  Data root:     {self.paths.data_root}")
-        print(f"  Checkpoints:   {self.paths.checkpoint_dir}")
-        print(f"  Output:        {self.paths.output_dir}")
+        print(f"  Data root:       {self.paths.data_root}")
+        print(f"  Checkpoints:     {self.paths.checkpoint_dir}")
+        print(f"  Output:          {self.paths.output_dir}")
+        print(f"  Preprocessed:    {self.paths.preprocessed_dir}")
         
         print("\n[Model]")
-        print(f"  Latent dim:    {self.model.latent_dim}")
-        print(f"  Frequencies:   {self.model.num_frequencies}")
+        print(f"  Latent dim:      {self.model.latent_dim}")
+        print(f"  Frequencies:     {self.model.num_frequencies}")
         
         print("\n[Training]")
-        print(f"  Batch size:    {self.train.batch_size}")
-        print(f"  Epochs:        {self.train.num_epochs}")
-        print(f"  Learning rate: {self.train.learning_rate}")
-        print(f"  Num points:    {self.train.num_points}")
-        print(f"  Category:      {self.train.category_filter or 'all'}")
+        print(f"  Batch size:      {self.train.batch_size}")
+        print(f"  Epochs:          {self.train.num_epochs}")
+        print(f"  Learning rate:   {self.train.learning_rate}")
+        print(f"  Num points:      {self.train.num_points}")
+        print(f"  Category:        {self.train.category_filter or 'all'}")
+        print(f"  Use preprocessed:{self.train.use_preprocessed}")
         
         print("\n[Inference]")
-        print(f"  Resolution:    {self.infer.resolution}")
-        print(f"  Threshold:     {self.infer.threshold}")
+        print(f"  Resolution:      {self.infer.resolution}")
+        print(f"  Threshold:       {self.infer.threshold}")
+        print(f"  Use mask:        {self.infer.use_mask}")
         
         print("\n[System]")
-        print(f"  Device:        {self.device}")
-        print(f"  AMP:           {self.use_amp}")
+        print(f"  Device:          {self.device}")
+        print(f"  AMP:             {self.use_amp}")
         
         if self.device == 'cuda':
-            print(f"  GPU:           {torch.cuda.get_device_name(0)}")
+            print(f"  GPU:             {torch.cuda.get_device_name(0)}")
             memory_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-            print(f"  GPU Memory:    {memory_gb:.1f} GB")
+            print(f"  GPU Memory:      {memory_gb:.1f} GB")
         
         print("=" * 60)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Конвертация конфигурации в словарь.
+        
+        Полезно для сохранения конфигурации в JSON или передачи в subprocess.
+        
+        Returns:
+            Dict со всеми параметрами
+        """
+        return {
+            'paths': {
+                'data_root': self.paths.data_root,
+                'checkpoint_dir': self.paths.checkpoint_dir,
+                'output_dir': self.paths.output_dir,
+                'cache_dir': self.paths.cache_dir,
+            },
+            'model': {
+                'latent_dim': self.model.latent_dim,
+                'num_frequencies': self.model.num_frequencies,
+            },
+            'train': {
+                'batch_size': self.train.batch_size,
+                'num_epochs': self.train.num_epochs,
+                'learning_rate': self.train.learning_rate,
+                'weight_decay': self.train.weight_decay,
+                'warmup_epochs': self.train.warmup_epochs,
+                'grad_clip': self.train.grad_clip,
+                'num_points': self.train.num_points,
+                'num_workers': self.train.num_workers,
+                'save_interval': self.train.save_interval,
+                'val_split': self.train.val_split,
+                'seed': self.train.seed,
+                'category_filter': self.train.category_filter,
+                'use_preprocessed': self.train.use_preprocessed,
+            },
+            'infer': {
+                'resolution': self.infer.resolution,
+                'threshold': self.infer.threshold,
+                'batch_size': self.infer.batch_size,
+                'use_mask': self.infer.use_mask,
+            }
+        }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -357,6 +415,8 @@ def update_config(**kwargs) -> Config:
     Обновить параметры конфигурации.
     
     Автоматически определяет, к какому подконфигу относится параметр.
+    Эта функция ДОЛЖНА вызываться из GUI перед запуском train.py
+    для применения пользовательских параметров.
     
     Args:
         **kwargs: параметры для обновления
@@ -365,29 +425,44 @@ def update_config(**kwargs) -> Config:
         Config: обновлённый объект конфигурации
     
     Пример:
-        update_config(batch_size=64, latent_dim=256)
+        # Из GUI перед запуском обучения:
+        update_config(
+            batch_size=64,
+            learning_rate=1e-4,
+            num_epochs=300,
+            category_filter='chair'
+        )
+        
         cfg = get_config()
         print(cfg.train.batch_size)  # 64
-        print(cfg.model.latent_dim)  # 256
     """
     global _config
     
+    updated = []
+    
     for key, value in kwargs.items():
+        # Пропускаем None значения
+        if value is None:
+            continue
+            
         # Ищем параметр в подконфигах
         if hasattr(_config.model, key):
             setattr(_config.model, key, value)
-            print(f"[config.py] model.{key} = {value}")
+            updated.append(f"model.{key}={value}")
         elif hasattr(_config.train, key):
             setattr(_config.train, key, value)
-            print(f"[config.py] train.{key} = {value}")
+            updated.append(f"train.{key}={value}")
         elif hasattr(_config.paths, key):
             setattr(_config.paths, key, value)
-            print(f"[config.py] paths.{key} = {value}")
+            updated.append(f"paths.{key}={value}")
         elif hasattr(_config.infer, key):
             setattr(_config.infer, key, value)
-            print(f"[config.py] infer.{key} = {value}")
+            updated.append(f"infer.{key}={value}")
         else:
-            print(f"[config.py] Warning: неизвестный параметр '{key}'")
+            print(f"[config.py] ⚠️ Неизвестный параметр: '{key}'")
+    
+    if updated:
+        print(f"[config.py] ✓ Обновлено: {', '.join(updated)}")
     
     return _config
 
@@ -401,7 +476,33 @@ def reset_config() -> Config:
     """
     global _config
     _config = Config()
+    print("[config.py] ✓ Конфигурация сброшена к значениям по умолчанию")
     return _config
+
+
+def apply_gui_config(gui_config: Dict[str, Any]) -> Config:
+    """
+    Применить конфигурацию из GUI.
+    
+    Специальная функция для интеграции с main.py.
+    Принимает словарь с параметрами и применяет их.
+    
+    Args:
+        gui_config: Словарь с параметрами из GUI
+    
+    Returns:
+        Config: обновлённый объект конфигурации
+    
+    Пример (из main.py):
+        gui_config = {
+            'batch_size': self.batch_spin.value(),
+            'num_epochs': self.epochs_spin.value(),
+            'learning_rate': float(self.lr_combo.currentText()),
+            'category_filter': category if category != 'all' else None,
+        }
+        apply_gui_config(gui_config)
+    """
+    return update_config(**gui_config)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -416,9 +517,22 @@ if __name__ == '__main__':
     cfg = get_config()
     cfg.print_config()
     
-    print("\n[Test] Обновление конфигурации:")
-    update_config(batch_size=64, latent_dim=256)
+    print("\n[Test] Обновление конфигурации из GUI:")
+    update_config(
+        batch_size=64,
+        latent_dim=256,
+        learning_rate=1e-4,
+        num_epochs=300,
+        category_filter='chair'
+    )
     
     print(f"\n[Test] Новые значения:")
     print(f"  batch_size = {cfg.train.batch_size}")
     print(f"  latent_dim = {cfg.model.latent_dim}")
+    print(f"  learning_rate = {cfg.train.learning_rate}")
+    print(f"  num_epochs = {cfg.train.num_epochs}")
+    print(f"  category_filter = {cfg.train.category_filter}")
+    
+    print("\n[Test] Конвертация в словарь:")
+    config_dict = cfg.to_dict()
+    print(f"  Ключи: {list(config_dict.keys())}")
