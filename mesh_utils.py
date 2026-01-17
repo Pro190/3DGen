@@ -429,6 +429,32 @@ def extract_mesh_marching_cubes(
     )
     
     # ─────────────────────────────────────────────────────────────────────────
+    # Шаг 2.5: Применяем Gaussian фильтр для уменьшения шума
+    # ─────────────────────────────────────────────────────────────────────────
+    #
+    # Сглаживание occupancy grid перед Marching Cubes уменьшает шум
+    # и артефакты на поверхности меша.
+    # ─────────────────────────────────────────────────────────────────────────
+    
+    try:
+        from scipy.ndimage import gaussian_filter, median_filter
+        
+        # Сначала median filter для удаления выбросов (шумных точек)
+        occupancy_grid = median_filter(occupancy_grid, size=3)
+        
+        # Затем Gaussian filter для мягкого сглаживания
+        occupancy_grid = gaussian_filter(occupancy_grid, sigma=0.5)
+        
+        if verbose:
+            print(f"[mesh_utils.py] Applied Median + Gaussian filters to reduce noise")
+    except ImportError:
+        if verbose:
+            print(f"[mesh_utils.py] scipy not available, skipping filters")
+    except Exception as e:
+        if verbose:
+            print(f"[mesh_utils.py] Warning: Filter failed: {e}")
+    
+    # ─────────────────────────────────────────────────────────────────────────
     # Шаг 3: Проверка occupancy
     # ─────────────────────────────────────────────────────────────────────────
     #
@@ -502,6 +528,39 @@ def extract_mesh_marching_cubes(
         if verbose:
             print(f"[mesh_utils.py] Mesh extracted: {len(mesh.vertices)} vertices, "
                   f"{len(mesh.faces)} faces")
+        
+        # ─────────────────────────────────────────────────────────────────────────
+        # Шаг 5: Базовая постобработка (удаление мелких компонентов)
+        # ─────────────────────────────────────────────────────────────────────────
+        
+        try:
+            # Исправление геометрии перед удалением компонентов
+            # (используем встроенную функцию repair_mesh напрямую)
+            try:
+                mesh.merge_vertices()
+                mesh.remove_degenerate_faces()
+                mesh.remove_duplicate_faces()
+            except:
+                pass
+            
+            components = mesh.split(only_watertight=False)
+            
+            if len(components) > 1:
+                # Фильтруем компоненты по размеру
+                valid_components = [
+                    c for c in components 
+                    if len(c.faces) >= 100
+                ]
+                
+                if valid_components:
+                    # Берём самый большой компонент
+                    mesh = max(valid_components, key=lambda x: len(x.vertices))
+                    if verbose:
+                        removed = len(components) - len(valid_components)
+                        print(f"[mesh_utils.py] Removed {removed} small components: "
+                              f"{len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
+        except Exception:
+            pass  # Если не удалось, продолжаем с исходным мешем
         
         return mesh
         
