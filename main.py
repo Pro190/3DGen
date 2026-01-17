@@ -220,7 +220,7 @@ class InferenceThread(QThread):
             self.progress.emit(5, "Импорт модулей...")
             
             from model import create_model
-            from mesh_utils import extract_mesh_marching_cubes, save_mesh, simplify_mesh
+            from mesh_utils import extract_mesh_marching_cubes, save_mesh, simplify_mesh, smooth_mesh
             
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
             self.log_message.emit(f"Device: {device}")
@@ -307,7 +307,10 @@ class InferenceThread(QThread):
                 points = points.unsqueeze(0)
                 with torch.no_grad():
                     logits = model.decode(latent, points)
-                    return torch.sigmoid(logits).squeeze(0)
+                    # Temperature scaling для смягчения предсказаний
+                    temperature = 0.8
+                    scaled_logits = logits / temperature
+                    return torch.sigmoid(scaled_logits).squeeze(0)
             
             # ─────────────────────────────────────────────────────────────────
             # Marching Cubes
@@ -334,6 +337,36 @@ class InferenceThread(QThread):
                 return
             
             self.log_message.emit(f"Меш создан: {len(mesh.vertices)} вершин, {len(mesh.faces)} граней")
+            
+            # ─────────────────────────────────────────────────────────────────
+            # Постобработка с сглаживанием для уменьшения шума
+            # ─────────────────────────────────────────────────────────────────
+            
+            # ─────────────────────────────────────────────────────────────────
+            # Улучшенная постобработка
+            # ─────────────────────────────────────────────────────────────────
+            
+            try:
+                from mesh_utils import repair_mesh
+                
+                # Исправление геометрии
+                self.log_message.emit("Исправление геометрии...")
+                mesh = repair_mesh(mesh)
+                
+                # Двухэтапное сглаживание
+                self.log_message.emit("Применение сглаживания (двухэтапное)...")
+                mesh = smooth_mesh(mesh, iterations=2, lamb=0.6)  # Агрессивное
+                mesh = smooth_mesh(mesh, iterations=2, lamb=0.3)  # Мягкое
+                
+                # Нормализация нормалей
+                try:
+                    mesh.fix_normals()
+                except:
+                    pass
+                
+                self.log_message.emit(f"Меш после постобработки: {len(mesh.vertices)} вершин, {len(mesh.faces)} граней")
+            except Exception as e:
+                self.log_message.emit(f"⚠️ Ошибка постобработки: {e}")
             
             # ─────────────────────────────────────────────────────────────────
             # Упрощение (опционально)
@@ -955,7 +988,7 @@ class MainWindow(QMainWindow):
             "на вкладке обучения."
         )
         info_label.setStyleSheet(
-            "padding: 10px; background-color: #e3f2fd; border-radius: 5px;"
+            "padding: 10px; background-color: #e3f2fd; border-radius: 5px; color: #212121;"
         )
         layout.addWidget(info_label)
         
