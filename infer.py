@@ -55,6 +55,7 @@ import trimesh
 
 from model import create_model
 from config import get_config
+from mesh_utils import smooth_mesh
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -245,11 +246,36 @@ class Inferencer:
             points_tensor = points_tensor.unsqueeze(0)
             
             logits = self.model.decode(latent, points_tensor)
-            probs = torch.sigmoid(logits).squeeze(0)
+            # Temperature scaling для смягчения предсказаний (меньше шума)
+            # Более низкая температура = более уверенные предсказания
+            temperature = 0.8  # Значения 0.7-1.0 дают хорошие результаты
+            scaled_logits = logits / temperature
+            probs = torch.sigmoid(scaled_logits).squeeze(0)
             occupancy_values.append(probs.cpu().numpy())
         
         occupancy = np.concatenate(occupancy_values)
         occupancy_grid = occupancy.reshape(resolution, resolution, resolution)
+        
+        # Применяем фильтры для уменьшения шума (median + gaussian)
+        if verbose:
+            print("[infer.py] Applying filters to reduce noise...")
+        try:
+            from scipy.ndimage import gaussian_filter, median_filter
+            
+            # Median filter удаляет выбросы (шумные точки)
+            occupancy_grid = median_filter(occupancy_grid, size=3)
+            
+            # Gaussian filter мягко сглаживает результат
+            occupancy_grid = gaussian_filter(occupancy_grid, sigma=0.5)
+            
+            if verbose:
+                print("[infer.py] Applied Median + Gaussian filters")
+        except ImportError:
+            if verbose:
+                print("[infer.py] scipy not available, skipping filters")
+        except Exception as e:
+            if verbose:
+                print(f"[infer.py] Warning: Filter failed: {e}")
         
         # Статистика occupancy
         if verbose:
@@ -299,8 +325,8 @@ class Inferencer:
             print(f"[infer.py] Marching Cubes failed: {e}")
             return None
         
-        # Постобработка
-        mesh = self._postprocess_mesh(mesh, verbose=verbose)
+        # Постобработка с сглаживанием для уменьшения шума
+        mesh = self._postprocess_mesh(mesh, verbose=verbose, smooth=True, min_faces=100)
         
         elapsed = (datetime.now() - start_time).total_seconds()
         
@@ -313,20 +339,85 @@ class Inferencer:
     def _postprocess_mesh(
         self,
         mesh: trimesh.Trimesh,
-        verbose: bool = True
+        verbose: bool = True,
+        smooth: bool = True,
+        min_faces: int = 100
     ) -> trimesh.Trimesh:
-        """Постобработка меша - удаление мелких компонентов."""
+        """
+        Постобработка меша - удаление шума и сглаживание.
+        
+        Args:
+            mesh: Входной меш
+            verbose: Выводить информацию
+            smooth: Применять сглаживание
+            min_faces: Минимальное количество граней для сохранения компонента
+        """
         
         try:
+            # Шаг 1: Исправление геометрических ошибок
+            if verbose:
+                print(f"[infer.py] Repairing mesh geometry...")
+            try:
+                from mesh_utils import repair_mesh
+                mesh = repair_mesh(mesh)
+                if verbose:
+                    print(f"[infer.py] Mesh repaired")
+            except Exception as e:
+                if verbose:
+                    print(f"[infer.py] Warning: repair failed: {e}")
+            
+            # Шаг 2: Удаление мелких компонентов (более агрессивная фильтрация)
             components = mesh.split(only_watertight=False)
             
             if len(components) > 1:
-                largest = max(components, key=lambda x: len(x.vertices))
+                # Фильтруем компоненты по размеру
+                valid_components = [
+                    c for c in components 
+                    if len(c.faces) >= min_faces
+                ]
+                
+                if valid_components:
+                    # Берём самый большой компонент
+                    mesh = max(valid_components, key=lambda x: len(x.vertices))
+                    
+                    if verbose:
+                        removed = len(components) - len(valid_components)
+                        print(f"[infer.py] Removed {removed} small components")
+                        print(f"[infer.py] Kept largest component: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
+                else:
+                    # Если все компоненты слишком маленькие, берём самый большой
+                    mesh = max(components, key=lambda x: len(x.vertices))
+                    if verbose:
+                        print(f"[infer.py] All components small, kept largest")
+        except Exception as e:
+            if verbose:
+                print(f"[infer.py] Warning: component filtering failed: {e}")
+        
+        # Шаг 3: Двухэтапное сглаживание для лучшего качества
+        if smooth:
+            try:
+                if verbose:
+                    print(f"[infer.py] Applying two-stage Laplacian smoothing...")
+                
+                # Первый этап: более агрессивное сглаживание (убирает основной шум)
+                mesh = smooth_mesh(mesh, iterations=2, lamb=0.6)
+                
+                # Второй этап: мягкое сглаживание (сохраняет детали)
+                mesh = smooth_mesh(mesh, iterations=2, lamb=0.3)
                 
                 if verbose:
-                    print(f"[infer.py] Kept largest of {len(components)} components")
-                
-                mesh = largest
+                    print(f"[infer.py] Mesh smoothed (two-stage)")
+            except Exception as e:
+                if verbose:
+                    print(f"[infer.py] Warning: smoothing failed: {e}")
+        
+        # Шаг 4: Нормализация нормалей для лучшего визуального качества
+        try:
+            mesh.vertex_normals
+            # Принудительно пересчитываем нормали после сглаживания
+            mesh.fix_normals()
+            if verbose:
+                print(f"[infer.py] Normals normalized")
         except Exception:
             pass
         
@@ -366,8 +457,8 @@ class Inferencer:
             image_path=image_path,
             mask_path=mask_path,
             use_mask=use_mask,
-            resolution=resolution,
-            threshold=threshold,
+            resolution=resolution or self.resolution,
+            threshold=threshold or self.threshold,
             verbose=True
         )
         
@@ -568,6 +659,8 @@ Examples:
             output_path=args.output,
             mask_path=args.mask,
             use_mask=args.use_mask,
+            resolution=args.resolution,
+            threshold=args.threshold,
             simplify=args.simplify,
             target_faces=args.target_faces
         )
