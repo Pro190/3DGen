@@ -13,19 +13,10 @@
     3. Препроцессинга датасета
     4. Управления чекпоинтами
 
-Вкладки интерфейса:
-    - 🎓 Обучение: настройка параметров и запуск обучения
-    - ✨ Генерация 3D: загрузка изображения и генерация меша
-    - ⚙️ Препроцессинг: подготовка датасета
-    - 📁 Чекпоинты: просмотр и управление сохранёнными моделями
-    - ⚙️ Настройки: пути и системная информация
-
-Запуск:
-    python main.py
-
-Требования:
-    - PyQt5 >= 5.15.0
-    - Все зависимости из requirements.txt
+Изменения:
+    - Параметры из GUI передаются в train.py через командную строку
+    - Генерация 3D работает только по фото (без обязательной маски)
+    - Добавлена опция использования препроцессированных данных
 """
 
 import sys
@@ -79,14 +70,8 @@ class TrainingThread(QThread):
     """
     Поток для запуска обучения в фоновом режиме.
     
-    Обучение выполняется через subprocess для изоляции
-    и возможности корректной остановки.
-    
-    Signals:
-        progress: (int, str) - прогресс и сообщение
-        log_message: (str) - строка для лога
-        finished: (str) - сообщение о завершении
-        metrics_update: (dict) - обновление метрик
+    ВАЖНО: Параметры из GUI передаются через командную строку train.py,
+    а не через update_config(), чтобы избежать проблем с subprocess.
     """
     
     progress = pyqtSignal(int, str)
@@ -95,10 +80,6 @@ class TrainingThread(QThread):
     metrics_update = pyqtSignal(dict)
     
     def __init__(self, config: Dict):
-        """
-        Args:
-            config: Словарь с параметрами обучения
-        """
         super().__init__()
         self.config = config
         self.process = None
@@ -112,10 +93,32 @@ class TrainingThread(QThread):
             self.log_message.emit("=" * 50)
             
             # ─────────────────────────────────────────────────────────────────
-            # Формирование команды
+            # Формирование команды с параметрами
             # ─────────────────────────────────────────────────────────────────
             
             cmd = [sys.executable, 'train.py']
+            
+            # Добавляем параметры из GUI
+            if self.config.get('batch_size'):
+                cmd.extend(['--batch_size', str(self.config['batch_size'])])
+            
+            if self.config.get('num_epochs'):
+                cmd.extend(['--num_epochs', str(self.config['num_epochs'])])
+            
+            if self.config.get('learning_rate'):
+                cmd.extend(['--learning_rate', str(self.config['learning_rate'])])
+            
+            if self.config.get('latent_dim'):
+                cmd.extend(['--latent_dim', str(self.config['latent_dim'])])
+            
+            if self.config.get('category') and self.config['category'] != 'all':
+                cmd.extend(['--category', self.config['category']])
+            
+            if self.config.get('save_interval'):
+                cmd.extend(['--save_interval', str(self.config['save_interval'])])
+            
+            if self.config.get('use_preprocessed'):
+                cmd.append('--use_preprocessed')
             
             self.log_message.emit(f"Команда: {' '.join(cmd)}")
             self.log_message.emit("")
@@ -141,8 +144,6 @@ class TrainingThread(QThread):
                 line = line.rstrip()
                 if line:
                     self.log_message.emit(line)
-                    
-                    # Парсинг метрик из вывода
                     self._parse_metrics(line)
             
             self.process.wait()
@@ -159,7 +160,6 @@ class TrainingThread(QThread):
     def _parse_metrics(self, line: str):
         """Парсинг метрик из строки вывода."""
         try:
-            # Ищем строки с метриками
             if 'Loss:' in line and 'IoU:' in line:
                 parts = line.split(',')
                 metrics = {}
@@ -169,8 +169,6 @@ class TrainingThread(QThread):
                         metrics['loss'] = float(part.split(':')[1].strip())
                     elif 'IoU:' in part:
                         metrics['iou'] = float(part.split(':')[1].strip())
-                    elif 'Acc:' in part:
-                        metrics['accuracy'] = float(part.split(':')[1].strip())
                 
                 if metrics:
                     self.metrics_update.emit(metrics)
@@ -184,14 +182,12 @@ class TrainingThread(QThread):
         if self.process and self.process.poll() is None:
             self.log_message.emit("\n⏹ Остановка обучения...")
             
-            # Отправляем SIGTERM для graceful shutdown
             if sys.platform == 'win32':
                 self.process.terminate()
             else:
                 import signal
                 self.process.send_signal(signal.SIGTERM)
             
-            # Ждём завершения
             try:
                 self.process.wait(timeout=30)
             except subprocess.TimeoutExpired:
@@ -207,13 +203,7 @@ class InferenceThread(QThread):
     """
     Поток для генерации 3D модели.
     
-    Выполняет инференс модели в фоновом режиме,
-    не блокируя GUI.
-    
-    Signals:
-        progress: (int, str) - прогресс и сообщение
-        log_message: (str) - строка для лога
-        finished: (str, dict) - сообщение и результат
+    ИЗМЕНЕНИЕ: Маска теперь опциональна, генерация работает только по фото.
     """
     
     progress = pyqtSignal(int, str)
@@ -221,10 +211,6 @@ class InferenceThread(QThread):
     finished = pyqtSignal(str, object)
     
     def __init__(self, config: Dict):
-        """
-        Args:
-            config: Словарь с параметрами генерации
-        """
         super().__init__()
         self.config = config
     
@@ -232,10 +218,6 @@ class InferenceThread(QThread):
         """Запуск генерации."""
         try:
             self.progress.emit(5, "Импорт модулей...")
-            
-            # ─────────────────────────────────────────────────────────────────
-            # Импорт необходимых модулей
-            # ─────────────────────────────────────────────────────────────────
             
             from model import create_model
             from mesh_utils import extract_mesh_marching_cubes, save_mesh, simplify_mesh
@@ -269,7 +251,6 @@ class InferenceThread(QThread):
             self.log_message.emit(f"Epoch: {checkpoint.get('epoch', '?')}")
             self.log_message.emit(f"Best IoU: {checkpoint.get('best_iou', 0):.4f}")
             
-            # Создание модели
             model = create_model(
                 latent_dim=latent_dim,
                 num_frequencies=num_frequencies
@@ -279,7 +260,7 @@ class InferenceThread(QThread):
             model.eval()
             
             # ─────────────────────────────────────────────────────────────────
-            # Загрузка изображения
+            # Загрузка изображения (БЕЗ ОБЯЗАТЕЛЬНОЙ МАСКИ)
             # ─────────────────────────────────────────────────────────────────
             
             self.progress.emit(30, "Загрузка изображения...")
@@ -294,17 +275,22 @@ class InferenceThread(QThread):
             ])
             
             img = Image.open(self.config['image']).convert('RGB')
+            self.log_message.emit(f"Изображение: {self.config['image']}")
             
-            # Применение маски
+            # Маска опциональна - применяем только если указана и use_mask=True
+            use_mask = self.config.get('use_mask', False)
             mask_path = self.config.get('mask')
-            if mask_path and os.path.exists(mask_path):
+            
+            if use_mask and mask_path and os.path.exists(mask_path):
                 try:
                     mask = Image.open(mask_path).convert('L')
                     background = Image.new('RGB', img.size, (255, 255, 255))
                     img = Image.composite(img, background, mask)
-                    self.log_message.emit("Маска применена")
+                    self.log_message.emit(f"Маска применена: {mask_path}")
                 except Exception as e:
-                    self.log_message.emit(f"Ошибка маски: {e}")
+                    self.log_message.emit(f"⚠️ Ошибка маски: {e}")
+            else:
+                self.log_message.emit("Генерация без маски (только по фото)")
             
             img_tensor = transform(img).unsqueeze(0).to(device)
             
@@ -317,7 +303,6 @@ class InferenceThread(QThread):
             with torch.no_grad():
                 latent = model.encode(img_tensor)
             
-            # Функция occupancy для Marching Cubes
             def occupancy_fn(points):
                 points = points.unsqueeze(0)
                 with torch.no_grad():
@@ -396,14 +381,7 @@ class InferenceThread(QThread):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class PreprocessThread(QThread):
-    """
-    Поток для препроцессинга датасета.
-    
-    Signals:
-        progress: (int, str) - прогресс и сообщение
-        log_message: (str) - строка для лога
-        finished: (str) - сообщение о завершении
-    """
+    """Поток для препроцессинга датасета."""
     
     progress = pyqtSignal(int, str)
     log_message = pyqtSignal(str)
@@ -432,7 +410,6 @@ class PreprocessThread(QThread):
             
             self.log_message.emit(f"Обработано {len(index)} образцов")
             
-            # Статистика
             stats = preprocessor.get_statistics()
             for key, value in stats.items():
                 if isinstance(value, dict):
@@ -455,18 +432,8 @@ class PreprocessThread(QThread):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class MainWindow(QMainWindow):
-    """
-    Главное окно приложения.
+    """Главное окно приложения."""
     
-    Содержит вкладки для всех функций:
-        - Обучение
-        - Генерация 3D
-        - Препроцессинг
-        - Чекпоинты
-        - Настройки
-    """
-    
-    # Пути по умолчанию
     DEFAULT_DATA_PATH = './PIX3D_DATA'
     DEFAULT_CKPT_PATH = './checkpoints'
     DEFAULT_OUTPUT_PATH = './inference_results'
@@ -477,25 +444,20 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Occupancy Network - 3D Reconstruction")
         self.setGeometry(100, 100, 1200, 800)
         
-        # Инициализация переменных
         self._data_path = self.DEFAULT_DATA_PATH
         self._ckpt_path = self.DEFAULT_CKPT_PATH
         self._output_path = self.DEFAULT_OUTPUT_PATH
         
         self.current_image_path = None
-        self.current_mask_path = None
         
-        # Центральный виджет
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         
         main_layout = QVBoxLayout(central_widget)
         
-        # Вкладки
         self.tabs = QTabWidget()
         main_layout.addWidget(self.tabs)
         
-        # Создаём вкладки
         self.tabs.addTab(self._create_training_tab(), "🎓 Обучение")
         self.tabs.addTab(self._create_inference_tab(), "✨ Генерация 3D")
         self.tabs.addTab(self._create_preprocessing_tab(), "⚙️ Препроцессинг")
@@ -509,19 +471,16 @@ class MainWindow(QMainWindow):
     # ═══════════════════════════════════════════════════════════════════════════
     
     def get_ckpt_path(self) -> str:
-        """Получение пути к чекпоинтам."""
         if hasattr(self, 'ckpt_path') and self.ckpt_path is not None:
             return self.ckpt_path.text()
         return self._ckpt_path
     
     def get_data_path(self) -> str:
-        """Получение пути к данным."""
         if hasattr(self, 'data_path') and self.data_path is not None:
             return self.data_path.text()
         return self._data_path
     
     def get_output_path(self) -> str:
-        """Получение пути к результатам."""
         if hasattr(self, 'output_path') and self.output_path is not None:
             return self.output_path.text()
         return self._output_path
@@ -535,10 +494,7 @@ class MainWindow(QMainWindow):
         widget = QWidget()
         layout = QHBoxLayout(widget)
         
-        # ─────────────────────────────────────────────────────────────────────
         # Левая панель - параметры
-        # ─────────────────────────────────────────────────────────────────────
-        
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         left_panel.setMaximumWidth(400)
@@ -547,7 +503,6 @@ class MainWindow(QMainWindow):
         model_group = QGroupBox("Модель")
         model_layout = QVBoxLayout()
         
-        # Latent dim
         row = QHBoxLayout()
         row.addWidget(QLabel("Latent dim:"))
         self.latent_spin = QSpinBox()
@@ -564,7 +519,6 @@ class MainWindow(QMainWindow):
         train_group = QGroupBox("Параметры обучения")
         train_layout = QVBoxLayout()
         
-        # Эпохи
         row = QHBoxLayout()
         row.addWidget(QLabel("Эпохи:"))
         self.epochs_spin = QSpinBox()
@@ -573,7 +527,6 @@ class MainWindow(QMainWindow):
         row.addWidget(self.epochs_spin)
         train_layout.addLayout(row)
         
-        # Batch size
         row = QHBoxLayout()
         row.addWidget(QLabel("Batch size:"))
         self.batch_spin = QSpinBox()
@@ -582,7 +535,6 @@ class MainWindow(QMainWindow):
         row.addWidget(self.batch_spin)
         train_layout.addLayout(row)
         
-        # Learning rate
         row = QHBoxLayout()
         row.addWidget(QLabel("Learning rate:"))
         self.lr_combo = QComboBox()
@@ -591,7 +543,6 @@ class MainWindow(QMainWindow):
         row.addWidget(self.lr_combo)
         train_layout.addLayout(row)
         
-        # Категория
         row = QHBoxLayout()
         row.addWidget(QLabel("Категория:"))
         self.category_combo = QComboBox()
@@ -599,7 +550,6 @@ class MainWindow(QMainWindow):
         row.addWidget(self.category_combo)
         train_layout.addLayout(row)
         
-        # Сохранение
         row = QHBoxLayout()
         row.addWidget(QLabel("Сохранять каждые:"))
         self.save_interval_spin = QSpinBox()
@@ -608,6 +558,14 @@ class MainWindow(QMainWindow):
         row.addWidget(self.save_interval_spin)
         row.addWidget(QLabel("эпох"))
         train_layout.addLayout(row)
+        
+        # Чекбокс для препроцессированных данных
+        self.use_preprocessed_cb = QCheckBox("Использовать препроцессированные данные")
+        self.use_preprocessed_cb.setToolTip(
+            "Ускоряет загрузку данных в 10-20 раз.\n"
+            "Требует предварительного запуска препроцессинга."
+        )
+        train_layout.addWidget(self.use_preprocessed_cb)
         
         train_group.setLayout(train_layout)
         left_layout.addWidget(train_group)
@@ -654,10 +612,7 @@ class MainWindow(QMainWindow):
         
         layout.addWidget(left_panel)
         
-        # ─────────────────────────────────────────────────────────────────────
         # Правая панель - лог
-        # ─────────────────────────────────────────────────────────────────────
-        
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         
@@ -682,14 +637,17 @@ class MainWindow(QMainWindow):
         return widget
     
     def _start_training(self):
-        """Запуск обучения."""
+        """Запуск обучения с параметрами из GUI."""
+        
+        # Собираем параметры из GUI
         config = {
             'latent_dim': self.latent_spin.value(),
             'num_epochs': self.epochs_spin.value(),
             'batch_size': self.batch_spin.value(),
             'learning_rate': float(self.lr_combo.currentText()),
-            'category': self.category_combo.currentText() if self.category_combo.currentText() != 'all' else None,
-            'save_interval': self.save_interval_spin.value()
+            'category': self.category_combo.currentText(),
+            'save_interval': self.save_interval_spin.value(),
+            'use_preprocessed': self.use_preprocessed_cb.isChecked()
         }
         
         self.train_thread = TrainingThread(config)
@@ -702,33 +660,38 @@ class MainWindow(QMainWindow):
         self.btn_train.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.train_log.clear()
+        
+        # Логируем параметры
+        self._append_train_log("Параметры обучения:")
+        self._append_train_log(f"  Latent dim: {config['latent_dim']}")
+        self._append_train_log(f"  Epochs: {config['num_epochs']}")
+        self._append_train_log(f"  Batch size: {config['batch_size']}")
+        self._append_train_log(f"  Learning rate: {config['learning_rate']}")
+        self._append_train_log(f"  Category: {config['category']}")
+        self._append_train_log(f"  Use preprocessed: {config['use_preprocessed']}")
+        self._append_train_log("")
     
     def _stop_training(self):
-        """Остановка обучения."""
         if hasattr(self, 'train_thread'):
             self.train_thread.stop()
             self.statusBar().showMessage("Остановка обучения...")
     
     def _update_train_progress(self, value: int, message: str):
-        """Обновление прогресса обучения."""
         self.train_progress.setValue(value)
         self.statusBar().showMessage(message)
     
     def _append_train_log(self, message: str):
-        """Добавление строки в лог."""
         self.train_log.append(message)
         scrollbar = self.train_log.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
     
     def _update_metrics(self, metrics: Dict):
-        """Обновление отображения метрик."""
         if 'loss' in metrics:
             self.metric_loss_label.setText(f"Loss: {metrics['loss']:.4f}")
         if 'iou' in metrics:
             self.metric_iou_label.setText(f"IoU: {metrics['iou']:.4f}")
     
     def _training_finished(self, message: str):
-        """Завершение обучения."""
         self.btn_train.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.statusBar().showMessage(message)
@@ -736,7 +699,7 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Обучение", message)
     
     # ═══════════════════════════════════════════════════════════════════════════
-    # ВКЛАДКА ГЕНЕРАЦИИ 3D
+    # ВКЛАДКА ГЕНЕРАЦИИ 3D (БЕЗ ОБЯЗАТЕЛЬНОЙ МАСКИ)
     # ═══════════════════════════════════════════════════════════════════════════
     
     def _create_inference_tab(self) -> QWidget:
@@ -744,10 +707,7 @@ class MainWindow(QMainWindow):
         widget = QWidget()
         layout = QHBoxLayout(widget)
         
-        # ─────────────────────────────────────────────────────────────────────
         # Левая панель
-        # ─────────────────────────────────────────────────────────────────────
-        
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         left_panel.setMaximumWidth(450)
@@ -756,15 +716,10 @@ class MainWindow(QMainWindow):
         img_group = QGroupBox("Входное изображение")
         img_layout = QVBoxLayout()
         
-        btn_row = QHBoxLayout()
+        # Только кнопка загрузки изображения (маска убрана)
         self.btn_load_image = QPushButton("📁 Загрузить изображение")
         self.btn_load_image.clicked.connect(self._load_image)
-        btn_row.addWidget(self.btn_load_image)
-        
-        self.btn_load_mask = QPushButton("🎭 Загрузить маску")
-        self.btn_load_mask.clicked.connect(self._load_mask)
-        btn_row.addWidget(self.btn_load_mask)
-        img_layout.addLayout(btn_row)
+        img_layout.addWidget(self.btn_load_image)
         
         self.image_label = QLabel("Изображение не загружено")
         self.image_label.setFixedSize(400, 400)
@@ -776,9 +731,6 @@ class MainWindow(QMainWindow):
         """)
         img_layout.addWidget(self.image_label, alignment=Qt.AlignCenter)
         
-        self.mask_info_label = QLabel("")
-        img_layout.addWidget(self.mask_info_label)
-        
         img_group.setLayout(img_layout)
         left_layout.addWidget(img_group)
         
@@ -786,7 +738,6 @@ class MainWindow(QMainWindow):
         params_group = QGroupBox("Параметры генерации")
         params_layout = QVBoxLayout()
         
-        # Чекпоинт
         row = QHBoxLayout()
         row.addWidget(QLabel("Чекпоинт:"))
         self.checkpoint_combo = QComboBox()
@@ -801,7 +752,6 @@ class MainWindow(QMainWindow):
         
         self._refresh_checkpoints()
         
-        # Разрешение
         row = QHBoxLayout()
         row.addWidget(QLabel("Разрешение:"))
         self.resolution_spin = QSpinBox()
@@ -811,7 +761,6 @@ class MainWindow(QMainWindow):
         row.addWidget(self.resolution_spin)
         params_layout.addLayout(row)
         
-        # Threshold
         row = QHBoxLayout()
         row.addWidget(QLabel("Threshold:"))
         self.threshold_spin = QDoubleSpinBox()
@@ -821,7 +770,6 @@ class MainWindow(QMainWindow):
         row.addWidget(self.threshold_spin)
         params_layout.addLayout(row)
         
-        # Формат
         row = QHBoxLayout()
         row.addWidget(QLabel("Формат:"))
         self.format_combo = QComboBox()
@@ -829,7 +777,6 @@ class MainWindow(QMainWindow):
         row.addWidget(self.format_combo)
         params_layout.addLayout(row)
         
-        # Упрощение
         self.simplify_cb = QCheckBox("Упростить меш")
         self.simplify_cb.setChecked(True)
         params_layout.addWidget(self.simplify_cb)
@@ -859,7 +806,6 @@ class MainWindow(QMainWindow):
         self.btn_generate.setEnabled(False)
         left_layout.addWidget(self.btn_generate)
         
-        # Прогресс
         self.infer_progress = QProgressBar()
         left_layout.addWidget(self.infer_progress)
         
@@ -867,10 +813,7 @@ class MainWindow(QMainWindow):
         
         layout.addWidget(left_panel)
         
-        # ─────────────────────────────────────────────────────────────────────
         # Правая панель - результат
-        # ─────────────────────────────────────────────────────────────────────
-        
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         
@@ -921,17 +864,6 @@ class MainWindow(QMainWindow):
             self.btn_generate.setEnabled(True)
             self.statusBar().showMessage(f"Загружено: {os.path.basename(path)}")
     
-    def _load_mask(self):
-        """Загрузка маски."""
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Выберите маску", "",
-            "Images (*.png *.jpg *.jpeg *.bmp)"
-        )
-        
-        if path:
-            self.current_mask_path = path
-            self.mask_info_label.setText(f"Маска: {os.path.basename(path)}")
-    
     def _refresh_checkpoints(self):
         """Обновление списка чекпоинтов."""
         self.checkpoint_combo.clear()
@@ -940,7 +872,6 @@ class MainWindow(QMainWindow):
         if os.path.exists(ckpt_dir):
             files = sorted([f for f in os.listdir(ckpt_dir) if f.endswith('.pth')])
             
-            # Сортировка: best первый, потом latest, потом по имени
             priority = {'best.pth': 0, 'latest.pth': 1}
             files.sort(key=lambda x: priority.get(x, 2))
             
@@ -948,7 +879,7 @@ class MainWindow(QMainWindow):
                 self.checkpoint_combo.addItem(f)
     
     def _generate_3d(self):
-        """Генерация 3D модели."""
+        """Генерация 3D модели (только по фото, без маски)."""
         if not self.current_image_path:
             return
         
@@ -957,9 +888,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Ошибка", "Выберите чекпоинт")
             return
         
+        # ИЗМЕНЕНИЕ: маска не передаётся, use_mask=False
         config = {
             'image': self.current_image_path,
-            'mask': self.current_mask_path,
+            'mask': None,  # Маска не используется
+            'use_mask': False,  # Генерация только по фото
             'checkpoint': os.path.join(self.get_ckpt_path(), checkpoint_file),
             'output': self.get_output_path(),
             'resolution': self.resolution_spin.value(),
@@ -980,12 +913,10 @@ class MainWindow(QMainWindow):
         self.result_info.clear()
     
     def _update_infer_progress(self, value: int, message: str):
-        """Обновление прогресса генерации."""
         self.infer_progress.setValue(value)
         self.result_label.setText(message)
     
     def _inference_finished(self, message: str, result: Optional[Dict]):
-        """Завершение генерации."""
         self.btn_generate.setEnabled(True)
         self.result_label.setText(message)
         
@@ -1006,7 +937,6 @@ class MainWindow(QMainWindow):
             )
     
     def _open_results_folder(self):
-        """Открытие папки с результатами."""
         self._open_folder(self.get_output_path())
     
     # ═══════════════════════════════════════════════════════════════════════════
@@ -1018,17 +948,17 @@ class MainWindow(QMainWindow):
         widget = QWidget()
         layout = QVBoxLayout(widget)
         
-        # Информация
         info_label = QLabel(
-            "Препроцессинг датасета позволяет ускорить обучение за счёт\n"
-            "предварительного вычисления точек на поверхности мешей."
+            "Препроцессинг датасета позволяет ускорить обучение в 10-20 раз\n"
+            "за счёт предварительного вычисления точек на поверхности мешей.\n\n"
+            "После препроцессинга включите опцию 'Использовать препроцессированные данные'\n"
+            "на вкладке обучения."
         )
         info_label.setStyleSheet(
             "padding: 10px; background-color: #e3f2fd; border-radius: 5px;"
         )
         layout.addWidget(info_label)
         
-        # Параметры
         params_group = QGroupBox("Параметры")
         params_layout = QVBoxLayout()
         
@@ -1055,7 +985,6 @@ class MainWindow(QMainWindow):
         params_group.setLayout(params_layout)
         layout.addWidget(params_group)
         
-        # Кнопка
         self.btn_preprocess = QPushButton("⚙️ Запустить препроцессинг")
         self.btn_preprocess.setStyleSheet(
             "background-color: #FF9800; color: white; padding: 10px;"
@@ -1063,11 +992,9 @@ class MainWindow(QMainWindow):
         self.btn_preprocess.clicked.connect(self._start_preprocessing)
         layout.addWidget(self.btn_preprocess)
         
-        # Прогресс
         self.preprocess_progress = QProgressBar()
         layout.addWidget(self.preprocess_progress)
         
-        # Лог
         self.preprocess_log = QTextEdit()
         self.preprocess_log.setReadOnly(True)
         layout.addWidget(self.preprocess_log)
@@ -1075,7 +1002,6 @@ class MainWindow(QMainWindow):
         return widget
     
     def _start_preprocessing(self):
-        """Запуск препроцессинга."""
         category = self.preprocess_category.currentText()
         
         config = {
@@ -1099,7 +1025,6 @@ class MainWindow(QMainWindow):
         self.preprocess_log.clear()
     
     def _preprocessing_finished(self, message: str):
-        """Завершение препроцессинга."""
         self.btn_preprocess.setEnabled(True)
         self.preprocess_log.append(message)
         QMessageBox.information(self, "Препроцессинг", message)
@@ -1109,7 +1034,6 @@ class MainWindow(QMainWindow):
     # ═══════════════════════════════════════════════════════════════════════════
     
     def _create_checkpoints_tab(self) -> QWidget:
-        """Создание вкладки чекпоинтов."""
         widget = QWidget()
         layout = QVBoxLayout(widget)
         
@@ -1119,7 +1043,6 @@ class MainWindow(QMainWindow):
         self.checkpoints_list.itemDoubleClicked.connect(self._view_checkpoint_info)
         layout.addWidget(self.checkpoints_list)
         
-        # Кнопки
         buttons = QHBoxLayout()
         
         btn_refresh = QPushButton("🔄 Обновить")
@@ -1136,7 +1059,6 @@ class MainWindow(QMainWindow):
         
         layout.addLayout(buttons)
         
-        # Информация о чекпоинте
         self.checkpoint_info = QTextEdit()
         self.checkpoint_info.setReadOnly(True)
         self.checkpoint_info.setMaximumHeight(200)
@@ -1147,7 +1069,6 @@ class MainWindow(QMainWindow):
         return widget
     
     def _refresh_checkpoints_list(self):
-        """Обновление списка чекпоинтов."""
         self.checkpoints_list.clear()
         
         ckpt_dir = self.get_ckpt_path()
@@ -1156,12 +1077,11 @@ class MainWindow(QMainWindow):
             
             for f in files:
                 path = os.path.join(ckpt_dir, f)
-                size = os.path.getsize(path) / 1e6  # MB
+                size = os.path.getsize(path) / 1e6
                 item = QListWidgetItem(f"{f} ({size:.1f} MB)")
                 self.checkpoints_list.addItem(item)
     
     def _view_checkpoint_info(self, item: QListWidgetItem):
-        """Просмотр информации о чекпоинте."""
         filename = item.text().split(' (')[0]
         path = os.path.join(self.get_ckpt_path(), filename)
         
@@ -1182,13 +1102,19 @@ class MainWindow(QMainWindow):
                 info.append(f"  Latent dim: {config.get('latent_dim', 'N/A')}")
                 info.append(f"  Type: {config.get('type', 'N/A')}")
             
+            train_config = checkpoint.get('train_config', {})
+            if train_config:
+                info.append(f"\nПараметры обучения:")
+                info.append(f"  Batch size: {train_config.get('batch_size', 'N/A')}")
+                info.append(f"  Learning rate: {train_config.get('learning_rate', 'N/A')}")
+                info.append(f"  Category: {train_config.get('category_filter', 'all')}")
+            
             self.checkpoint_info.setText('\n'.join(info))
             
         except Exception as e:
             self.checkpoint_info.setText(f"Ошибка загрузки: {e}")
     
     def _delete_checkpoint(self):
-        """Удаление выбранного чекпоинта."""
         item = self.checkpoints_list.currentItem()
         if not item:
             return
@@ -1221,15 +1147,12 @@ class MainWindow(QMainWindow):
     # ═══════════════════════════════════════════════════════════════════════════
     
     def _create_settings_tab(self) -> QWidget:
-        """Создание вкладки настроек."""
         widget = QWidget()
         layout = QVBoxLayout(widget)
         
-        # Группа: Пути
         paths_group = QGroupBox("Пути")
         paths_layout = QVBoxLayout()
         
-        # Датасет
         row = QHBoxLayout()
         row.addWidget(QLabel("Датасет:"))
         self.data_path = QLineEdit(self._data_path)
@@ -1240,7 +1163,6 @@ class MainWindow(QMainWindow):
         row.addWidget(btn)
         paths_layout.addLayout(row)
         
-        # Чекпоинты
         row = QHBoxLayout()
         row.addWidget(QLabel("Чекпоинты:"))
         self.ckpt_path = QLineEdit(self._ckpt_path)
@@ -1251,7 +1173,6 @@ class MainWindow(QMainWindow):
         row.addWidget(btn)
         paths_layout.addLayout(row)
         
-        # Результаты
         row = QHBoxLayout()
         row.addWidget(QLabel("Результаты:"))
         self.output_path = QLineEdit(self._output_path)
@@ -1265,7 +1186,6 @@ class MainWindow(QMainWindow):
         paths_group.setLayout(paths_layout)
         layout.addWidget(paths_group)
         
-        # Группа: Информация о системе
         info_group = QGroupBox("Информация о системе")
         info_layout = QVBoxLayout()
         
@@ -1293,13 +1213,11 @@ class MainWindow(QMainWindow):
     # ═══════════════════════════════════════════════════════════════════════════
     
     def _browse_folder(self, line_edit: QLineEdit):
-        """Выбор папки через диалог."""
         folder = QFileDialog.getExistingDirectory(self, "Выберите папку")
         if folder:
             line_edit.setText(folder)
     
     def _open_folder(self, path: str):
-        """Открытие папки в файловом менеджере."""
         if not os.path.exists(path):
             os.makedirs(path, exist_ok=True)
         
@@ -1316,22 +1234,13 @@ class MainWindow(QMainWindow):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    """
-    Главная функция запуска приложения.
-    
-    Настраивает тёмную тему и запускает GUI.
-    """
+    """Главная функция запуска приложения."""
     
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     
-    # ─────────────────────────────────────────────────────────────────────────
-    # Настройка тёмной темы
-    # ─────────────────────────────────────────────────────────────────────────
-    
+    # Тёмная тема
     palette = QPalette()
-    
-    # Основные цвета
     palette.setColor(QPalette.Window, QColor(53, 53, 53))
     palette.setColor(QPalette.WindowText, Qt.white)
     palette.setColor(QPalette.Base, QColor(25, 25, 25))
@@ -1342,17 +1251,11 @@ def main():
     palette.setColor(QPalette.Button, QColor(53, 53, 53))
     palette.setColor(QPalette.ButtonText, Qt.white)
     palette.setColor(QPalette.BrightText, Qt.red)
-    
-    # Акцентные цвета
     palette.setColor(QPalette.Link, QColor(42, 130, 218))
     palette.setColor(QPalette.Highlight, QColor(42, 130, 218))
     palette.setColor(QPalette.HighlightedText, Qt.black)
     
     app.setPalette(palette)
-    
-    # ─────────────────────────────────────────────────────────────────────────
-    # Запуск окна
-    # ─────────────────────────────────────────────────────────────────────────
     
     window = MainWindow()
     window.show()
