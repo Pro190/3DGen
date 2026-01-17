@@ -205,7 +205,7 @@ class TrainConfig:
     category_filter: Optional[str] = None
     
     # Использовать препроцессированные данные
-    use_preprocessed: bool = False
+    use_preprocessed: bool = True
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -242,12 +242,20 @@ class InferConfig:
         
         use_mask: Использовать маску для удаления фона
                  По умолчанию False - генерация только по фото
+        
+        smooth_mesh: Применять сглаживание меша для уменьшения шума
+                    True рекомендуется для уменьшения артефактов
+        
+        min_component_faces: Минимальное количество граней для сохранения компонента
+                            Меньшие компоненты удаляются как шум
     """
     
     resolution: int = 128
     threshold: float = 0.5
     batch_size: int = 100000
     use_mask: bool = False  # По умолчанию генерация только по фото
+    smooth_mesh: bool = True  # Сглаживание для уменьшения шума
+    min_component_faces: int = 100  # Минимальный размер компонента
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -332,6 +340,8 @@ class Config:
         print(f"  Resolution:      {self.infer.resolution}")
         print(f"  Threshold:       {self.infer.threshold}")
         print(f"  Use mask:        {self.infer.use_mask}")
+        print(f"  Smooth mesh:     {self.infer.smooth_mesh}")
+        print(f"  Min component:   {self.infer.min_component_faces} faces")
         
         print("\n[System]")
         print(f"  Device:          {self.device}")
@@ -384,6 +394,8 @@ class Config:
                 'threshold': self.infer.threshold,
                 'batch_size': self.infer.batch_size,
                 'use_mask': self.infer.use_mask,
+                'smooth_mesh': self.infer.smooth_mesh,
+                'min_component_faces': self.infer.min_component_faces,
             }
         }
 
