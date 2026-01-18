@@ -11,7 +11,7 @@ import os
 import sys
 import zipfile
 import urllib.request
-import hashlib
+import shutil
 from pathlib import Path
 from tqdm import tqdm
 
@@ -67,7 +67,6 @@ def check_disk_space(required_gb: float, path: str = ".") -> bool:
     Returns:
         True если места достаточно
     """
-    import shutil
     total, used, free = shutil.disk_usage(path)
     free_gb = free / (1024 ** 3)
     
@@ -75,6 +74,49 @@ def check_disk_space(required_gb: float, path: str = ".") -> bool:
     print(f"📊 Требуется: ~{required_gb} GB (архив + распакованные данные)")
     
     return free_gb >= required_gb
+
+
+def move_dataset_contents(source_dir: Path, target_dir: Path) -> None:
+    """
+    Перемещение содержимого датасета в целевую директорию.
+    
+    Args:
+        source_dir: Исходная директория (pix3d после распаковки)
+        target_dir: Целевая директория (PIX3D_DATA)
+    """
+    # Список элементов для перемещения
+    items_to_move = ["img", "mask", "model", "pix3d.json"]
+    
+    print(f"\n📂 Перемещение данных в {target_dir.name}/")
+    
+    # Создаём целевую директорию
+    target_dir.mkdir(parents=True, exist_ok=True)
+    
+    with tqdm(total=len(items_to_move), desc="Перемещение", unit="элемент") as pbar:
+        for item_name in items_to_move:
+            src_path = source_dir / item_name
+            dst_path = target_dir / item_name
+            
+            if src_path.exists():
+                # Удаляем целевой путь если уже существует
+                if dst_path.exists():
+                    if dst_path.is_dir():
+                        shutil.rmtree(str(dst_path))
+                    else:
+                        dst_path.unlink()
+                
+                # Перемещаем
+                shutil.move(str(src_path), str(dst_path))
+                pbar.set_postfix_str(item_name)
+            else:
+                print(f"\n⚠️  Предупреждение: {item_name} не найден в архиве")
+            
+            pbar.update(1)
+    
+    # Удаляем исходную директорию (pix3d) после перемещения
+    if source_dir.exists():
+        print(f"\n🗑️  Удаление временной директории: {source_dir.name}/")
+        shutil.rmtree(str(source_dir))
 
 
 def install_pix3d(
@@ -114,12 +156,14 @@ def install_pix3d(
     install_path.mkdir(parents=True, exist_ok=True)
     
     zip_path = install_path / "pix3d.zip"
-    dataset_path = install_path / "pix3d"
+    temp_extract_path = install_path / "pix3d"  # Временная папка при распаковке
+    dataset_path = install_path / "PIX3D_DATA"  # Итоговая папка с данными
     
     print("=" * 60)
     print("🎨 Установщик датасета Pix3D")
     print("=" * 60)
     print(f"📁 Директория установки: {install_path}")
+    print(f"📁 Папка датасета: {dataset_path}")
     print(f"🔗 URL: {DATASET_URL}")
     print(f"📦 Размер архива: ~{ARCHIVE_SIZE_GB} GB")
     print("=" * 60)
@@ -183,13 +227,22 @@ def install_pix3d(
         print("❌ Архив повреждён. Удалите его и запустите скрипт заново.")
         sys.exit(1)
     
-    # Распаковка
+    # Распаковка во временную директорию
     try:
         extract_zip(str(zip_path), str(install_path))
         print("\n✅ Распаковка завершена!")
         
     except Exception as e:
         print(f"\n❌ Ошибка распаковки: {e}")
+        sys.exit(1)
+    
+    # Перемещение содержимого в PIX3D_DATA
+    try:
+        move_dataset_contents(temp_extract_path, dataset_path)
+        print("✅ Данные перемещены в PIX3D_DATA!")
+        
+    except Exception as e:
+        print(f"\n❌ Ошибка перемещения данных: {e}")
         sys.exit(1)
     
     # Удаление архива (опционально)
@@ -206,14 +259,17 @@ def install_pix3d(
     
     # Показываем структуру
     if dataset_path.exists():
-        print("\n📂 Структура датасета:")
-        for item in sorted(dataset_path.iterdir())[:10]:
+        print("\n📂 Структура датасета PIX3D_DATA:")
+        for item in sorted(dataset_path.iterdir()):
             if item.is_dir():
-                print(f"   📁 {item.name}/")
+                # Считаем файлы в поддиректории
+                file_count = sum(1 for _ in item.rglob("*") if _.is_file())
+                print(f"   📁 {item.name}/ ({file_count} файлов)")
             else:
-                print(f"   📄 {item.name}")
+                size_kb = item.stat().st_size / 1024
+                print(f"   📄 {item.name} ({size_kb:.1f} KB)")
         
-        # Считаем количество файлов
+        # Считаем общее количество файлов
         total_files = sum(1 for _ in dataset_path.rglob("*") if _.is_file())
         print(f"\n   📊 Всего файлов: {total_files}")
     
