@@ -234,7 +234,7 @@ class Trainer:
             print(f"[train.py] 💾 Checkpoint saved: {reason}")
         
         if is_best:
-            best_path = os.path.join(self.cfg.paths.checkpoint_dir, 'best.pth')
+            best_path = os.path.join(self.cfg.paths.checkpoint_dir, 'model.pth')
             torch.save(state, best_path)
             print(f"[train.py] ⭐ Best model saved (IoU: {self.best_iou:.4f})")
         

@@ -575,8 +575,8 @@ Examples:
         help='Path to input image'
     )
     parser.add_argument(
-        '--checkpoint', type=str, default='./checkpoints/best.pth',
-        help='Path to model checkpoint (default: ./checkpoints/best.pth)'
+        '--checkpoint', type=str, default='./checkpoints/model.pth',
+        help='Path to model checkpoint (default: ./checkpoints/model.pth)'
     )
     parser.add_argument(
         '--output', type=str, default=None,

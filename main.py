@@ -905,7 +905,7 @@ class MainWindow(QMainWindow):
         if os.path.exists(ckpt_dir):
             files = sorted([f for f in os.listdir(ckpt_dir) if f.endswith('.pth')])
             
-            priority = {'best.pth': 0, 'latest.pth': 1}
+            priority = {'model.pth': 0, 'latest.pth': 1}
             files.sort(key=lambda x: priority.get(x, 2))
             
             for f in files:
@@ -1154,7 +1154,7 @@ class MainWindow(QMainWindow):
         
         filename = item.text().split(' (')[0]
         
-        if filename in ['best.pth', 'latest.pth']:
+        if filename in ['model.pth', 'latest.pth']:
             QMessageBox.warning(
                 self, "Предупреждение",
                 f"Не рекомендуется удалять {filename}"
