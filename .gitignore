@@ -31,8 +31,13 @@ wheels/
 MANIFEST
 
 # PyTorch / ML specific
+<<<<<<< HEAD
 #*.pth
 #checkpoints/
+=======
+*.pth
+checkpoints/
+>>>>>>> ab93e72bbd362518b0a0e78afe7eb2d8c419bf04
 cache/
 inference_results/
 visualizations/
