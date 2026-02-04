@@ -45,9 +45,6 @@ class PositionalEncoding(nn.Module):
 class Encoder(nn.Module):
     """
     ResNet50 encoder → global latent vector.
-    
-    ВАЖНО: Структура полностью совместима с train_global.py!
-    Имена: self.features, self.fc
     """
     
     def __init__(self, latent_dim: int = 512):
@@ -80,9 +77,6 @@ class Encoder(nn.Module):
 class Decoder(nn.Module):
     """
     MLP decoder для предсказания occupancy.
-    
-    ВАЖНО: Структура полностью совместима с train_global.py!
-    Имена: self.net
     """
     
     def __init__(self, latent_dim: int = 512, point_dim: int = 63):
@@ -129,11 +123,6 @@ class Decoder(nn.Module):
 class OccupancyNetwork(nn.Module):
     """
     Occupancy Network с Global Latent архитектурой.
-    
-    ВАЖНО: Имена атрибутов совместимы с train_global.py:
-    - self.encoder
-    - self.pos_enc (НЕ pos_encoding!)
-    - self.decoder
     """
     
     def __init__(self, latent_dim: int = 512, num_frequencies: int = 10):
@@ -187,11 +176,6 @@ class OccupancyNetwork(nn.Module):
             'num_frequencies': self.num_frequencies,
             'type': 'global'
         }
-
-
-# Алиас для совместимости с train_global.py
-OccupancyNetworkGlobal = OccupancyNetwork
-
 
 def create_model(
     latent_dim: int = 512,
